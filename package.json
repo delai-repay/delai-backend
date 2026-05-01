@@ -4,9 +4,9 @@
   "type": "module",
   "description": "Backend API for Delai early access signups",
   "main": "src/server.js",
-  "scripts": {
-    "dev": "nodemon src/server.js",
-    "start": "node src/server.js"
+  "scripts": {    
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
