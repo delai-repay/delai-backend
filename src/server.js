@@ -3,6 +3,7 @@ import cors from "cors";
 import helmet from "helmet";
 import dotenv from "dotenv";
 import { query } from "./db.js";
+import { supabaseAdmin } from "./lib/supabaseAdmin.js";
 
 dotenv.config();
 
@@ -22,6 +23,32 @@ app.get("/health", (req, res) => {
     ok: true,
     service: "delai-backend",
   });
+});
+
+app.get("/detect-delays-test", async (req, res) => {
+  try {
+    const { data: commutes, error: commuteError } = await supabaseAdmin
+      .from("commutes")
+      .select("*");
+
+    if (commuteError) {
+      throw commuteError;
+    }
+
+    res.json({
+      ok: true,
+      message: "Delay detection test endpoint is working.",
+      commute_count: commutes?.length || 0,
+      commutes: commutes || [],
+    });
+  } catch (error) {
+    console.error("Delay detection test failed:", error);
+
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
 });
 
 app.post("/early-access", async (req, res) => {

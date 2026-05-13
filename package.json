@@ -4,11 +4,12 @@
   "type": "module",
   "description": "Backend API for Delai early access signups",
   "main": "src/server.js",
-  "scripts": {    
+  "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.105.4",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
