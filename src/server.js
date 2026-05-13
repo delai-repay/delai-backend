@@ -51,6 +51,107 @@ app.get("/detect-delays-test", async (req, res) => {
   }
 });
 
+app.post("/detect-delays", async (req, res) => {
+  try {
+    const { data: commutes, error: commuteError } = await supabaseAdmin
+      .from("commutes")
+      .select("*");
+
+    if (commuteError) {
+      throw commuteError;
+    }
+
+    if (!commutes || commutes.length === 0) {
+      return res.json({
+        ok: true,
+        message: "No commutes found to check.",
+        checked_commutes: 0,
+        created_count: 0,
+        created_delays: [],
+      });
+    }
+
+    const today = new Date();
+    const todayDate = today.toISOString().split("T")[0];
+    const todayDay = today.toLocaleDateString("en-GB", {
+      weekday: "long",
+    });
+
+    const createdDelays = [];
+
+    for (const commute of commutes) {
+      const travelDays = Array.isArray(commute.travel_days)
+        ? commute.travel_days
+        : [];
+
+      if (!travelDays.includes(todayDay)) {
+        continue;
+      }
+
+      const testDelay = {
+        user_id: commute.user_id,
+        commute_id: commute.id,
+        operator: commute.operator,
+        origin_station: commute.origin_station,
+        destination_station: commute.destination_station,
+        travel_window: commute.outbound_time,
+        direction: "outbound",
+        delay_date: todayDate,
+        scheduled_time: commute.outbound_time,
+        actual_time: "Test delay",
+        delay_minutes: 18,
+        status: "detected",
+        source: "manual_test_endpoint",
+        updated_at: new Date().toISOString(),
+      };
+
+      const { data: existingDelay, error: existingError } = await supabaseAdmin
+        .from("detected_delays")
+        .select("id")
+        .eq("user_id", commute.user_id)
+        .eq("commute_id", commute.id)
+        .eq("delay_date", todayDate)
+        .eq("direction", "outbound")
+        .maybeSingle();
+
+      if (existingError) {
+        throw existingError;
+      }
+
+      if (existingDelay) {
+        continue;
+      }
+
+      const { data: insertedDelay, error: insertError } = await supabaseAdmin
+        .from("detected_delays")
+        .insert(testDelay)
+        .select("*")
+        .single();
+
+      if (insertError) {
+        throw insertError;
+      }
+
+      createdDelays.push(insertedDelay);
+    }
+
+    res.json({
+      ok: true,
+      message: "Delay detection completed.",
+      checked_commutes: commutes.length,
+      created_count: createdDelays.length,
+      created_delays: createdDelays,
+    });
+  } catch (error) {
+    console.error("Delay detection failed:", error);
+
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
+
 app.post("/early-access", async (req, res) => {
   try {
     const {
