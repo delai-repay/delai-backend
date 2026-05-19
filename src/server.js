@@ -152,6 +152,162 @@ app.post("/detect-delays", async (req, res) => {
   }
 });
 
+app.post("/prepare-claim", async (req, res) => {
+  try {
+    const { user_id, claim_id } = req.body;
+
+    if (!user_id || !claim_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing user_id or claim_id",
+      });
+    }
+
+    const { data: claim, error: claimError } = await supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (claimError || !claim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim not found",
+      });
+    }
+
+    const { data: detectedDelay, error: delayError } = await supabaseAdmin
+      .from("detected_delays")
+      .select("*")
+      .eq("id", claim.detected_delay_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (delayError || !detectedDelay) {
+      return res.status(404).json({
+        success: false,
+        error: "Linked detected delay not found",
+      });
+    }
+
+    const { data: seasonTickets, error: ticketError } = await supabaseAdmin
+      .from("season_tickets")
+      .select("*")
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (ticketError) {
+      throw ticketError;
+    }
+
+    const seasonTicket = seasonTickets?.[0] || null;
+
+    const { data: commutes, error: commuteError } = await supabaseAdmin
+      .from("commutes")
+      .select("*")
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (commuteError) {
+      throw commuteError;
+    }
+
+    const commute = commutes?.[0] || null;
+
+    const ticketRoute =
+      seasonTicket?.origin_station && seasonTicket?.destination_station
+        ? `${seasonTicket.origin_station} to ${seasonTicket.destination_station}`
+        : "Not recorded";
+
+    const commuteRoute =
+      commute?.origin_station && commute?.destination_station
+        ? `${commute.origin_station} to ${commute.destination_station}`
+        : "Not recorded";
+
+    const travelDays = Array.isArray(commute?.travel_days)
+      ? commute.travel_days.join(", ")
+      : commute?.travel_days || "Not recorded";
+
+    const preparedSummary = `
+Delay Repay Claim Summary
+
+Claim status: prepared
+
+Delay details:
+- Date: ${detectedDelay.delay_date || "Not recorded"}
+- Route: ${
+      detectedDelay.origin_station && detectedDelay.destination_station
+        ? `${detectedDelay.origin_station} to ${detectedDelay.destination_station}`
+        : "Not recorded"
+    }
+- Direction: ${detectedDelay.direction || "Not recorded"}
+- Travel window: ${detectedDelay.travel_window || "Not recorded"}
+- Scheduled time: ${detectedDelay.scheduled_time || "Not recorded"}
+- Actual time: ${detectedDelay.actual_time || "Not recorded"}
+- Detected delay: ${
+      detectedDelay.delay_minutes
+        ? `${detectedDelay.delay_minutes} minutes`
+        : "Not recorded"
+    }
+- Operator: ${detectedDelay.operator || "Not recorded"}
+
+Ticket details:
+- Ticket route: ${ticketRoute}
+- Ticket type: ${seasonTicket?.ticket_type || "Not recorded"}
+- Ticket cost: ${seasonTicket?.ticket_cost || "Not recorded"}
+- Ticket start date: ${seasonTicket?.ticket_start_date || "Not recorded"}
+- Ticket end date: ${seasonTicket?.ticket_end_date || "Not recorded"}
+- Smartcard provider: ${seasonTicket?.smartcard_provider || "Not recorded"}
+- Smartcard number: ${seasonTicket?.smartcard_number || "Not recorded"}
+
+Commute details:
+- Saved commute route: ${commuteRoute}
+- Outbound window: ${commute?.outbound_time || "Not recorded"}
+- Return window: ${commute?.return_time || "Not recorded"}
+- Travel days: ${travelDays}
+
+Passenger confirmation:
+- User confirmed they travelled on this delayed service.
+
+Suggested next action:
+- Review this information, then use it to complete the operator's Delay Repay claim form.
+`.trim();
+
+    const { data: updatedClaim, error: updateError } = await supabaseAdmin
+      .from("claims")
+      .update({
+        status: "prepared",
+        prepared_summary: preparedSummary,
+        prepared_at: new Date().toISOString(),
+      })
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    res.json({
+      success: true,
+      claim: updatedClaim,
+      prepared_summary: preparedSummary,
+    });
+  } catch (error) {
+    console.error("Prepare claim error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to prepare claim",
+      details: error.message,
+    });
+  }
+});
+
 app.post("/early-access", async (req, res) => {
   try {
     const {
