@@ -450,6 +450,68 @@ Suggested next action:
   }
 });
 
+app.post("/mark-claim-ready", async (req, res) => {
+  try {
+    const { user_id, claim_id } = req.body;
+
+    if (!user_id || !claim_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing user_id or claim_id",
+      });
+    }
+
+    const { data: claim, error: claimError } = await supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (claimError || !claim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim not found",
+      });
+    }
+
+    if (claim.status !== "prepared" && claim.status !== "ready_to_submit") {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Claim must be prepared before it can be marked ready to submit.",
+      });
+    }
+
+    const { data: updatedClaim, error: updateError } = await supabaseAdmin
+      .from("claims")
+      .update({
+        status: "ready_to_submit",
+      })
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    res.json({
+      success: true,
+      claim: updatedClaim,
+    });
+  } catch (error) {
+    console.error("Mark claim ready error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to mark claim as ready to submit",
+      details: error.message,
+    });
+  }
+});
+
 app.post("/early-access", async (req, res) => {
   try {
     const {
