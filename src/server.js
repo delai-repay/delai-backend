@@ -35,6 +35,117 @@ app.use(
   })
 );
 
+function getOperatorClaimGuidance(operatorName) {
+  const operator = (operatorName || "").toLowerCase();
+
+  if (operator.includes("greater anglia")) {
+    return {
+      operatorName: "Greater Anglia",
+      claimPortal: "Greater Anglia Delay Repay",
+      delayThreshold:
+        "Claims are usually available for delays of 15 minutes or more.",
+      evidenceNeeded:
+        "Ticket or smartcard details, journey date, origin and destination, and delay length.",
+      suggestedWording:
+        "The passenger travelled on the delayed Greater Anglia service shown above and is requesting Delay Repay compensation based on the confirmed delay.",
+    };
+  }
+
+  if (operator.includes("c2c")) {
+    return {
+      operatorName: "c2c",
+      claimPortal: "c2c Delay Repay",
+      delayThreshold:
+        "Claims are usually available for delays of 15 minutes or more.",
+      evidenceNeeded:
+        "Ticket or smartcard details, journey date, origin and destination, and delay length.",
+      suggestedWording:
+        "The passenger travelled on the delayed c2c service shown above and is requesting Delay Repay compensation based on the confirmed delay.",
+    };
+  }
+
+  if (
+    operator.includes("southern") ||
+    operator.includes("thameslink") ||
+    operator.includes("great northern") ||
+    operator.includes("gatwick express")
+  ) {
+    return {
+      operatorName: "Govia Thameslink Railway",
+      claimPortal: "GTR Delay Repay",
+      delayThreshold:
+        "Claims are usually available for delays of 15 minutes or more.",
+      evidenceNeeded:
+        "Ticket details, journey date, origin and destination, scheduled travel time and delay length.",
+      suggestedWording:
+        "The passenger travelled on the delayed GTR service shown above and is requesting Delay Repay compensation based on the confirmed delay.",
+    };
+  }
+
+  if (operator.includes("southeastern")) {
+    return {
+      operatorName: "Southeastern",
+      claimPortal: "Southeastern Delay Repay",
+      delayThreshold:
+        "Claims are usually available for delays of 15 minutes or more.",
+      evidenceNeeded:
+        "Ticket details, journey date, origin and destination, and delay length.",
+      suggestedWording:
+        "The passenger travelled on the delayed Southeastern service shown above and is requesting Delay Repay compensation based on the confirmed delay.",
+    };
+  }
+
+  if (operator.includes("lner")) {
+    return {
+      operatorName: "LNER",
+      claimPortal: "LNER Delay Repay",
+      delayThreshold:
+        "Claims are usually available for eligible delayed journeys.",
+      evidenceNeeded:
+        "Ticket details, journey date, origin and destination, and delay length.",
+      suggestedWording:
+        "The passenger travelled on the delayed LNER service shown above and is requesting Delay Repay compensation based on the confirmed delay.",
+    };
+  }
+
+  if (operator.includes("avanti")) {
+    return {
+      operatorName: "Avanti West Coast",
+      claimPortal: "Avanti West Coast Delay Repay",
+      delayThreshold:
+        "Claims are usually available for eligible delayed journeys.",
+      evidenceNeeded:
+        "Ticket details, journey date, origin and destination, and delay length.",
+      suggestedWording:
+        "The passenger travelled on the delayed Avanti West Coast service shown above and is requesting Delay Repay compensation based on the confirmed delay.",
+    };
+  }
+
+  if (operator.includes("gwr") || operator.includes("great western")) {
+    return {
+      operatorName: "Great Western Railway",
+      claimPortal: "GWR Delay Repay",
+      delayThreshold:
+        "Claims are usually available for eligible delayed journeys.",
+      evidenceNeeded:
+        "Ticket details, journey date, origin and destination, and delay length.",
+      suggestedWording:
+        "The passenger travelled on the delayed Great Western Railway service shown above and is requesting Delay Repay compensation based on the confirmed delay.",
+    };
+  }
+
+  return {
+    operatorName: operatorName || "Unknown operator",
+    claimPortal: "Operator Delay Repay claim form",
+    delayThreshold:
+      "Check the operator's Delay Repay rules before submitting the claim.",
+    evidenceNeeded:
+      "Ticket details, journey date, origin and destination, and delay length.",
+    suggestedWording:
+      "The passenger confirmed they travelled on the delayed service shown above and is requesting Delay Repay compensation based on the confirmed delay.",
+  };
+}
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -253,10 +364,20 @@ app.post("/prepare-claim", async (req, res) => {
       ? commute.travel_days.join(", ")
       : commute?.travel_days || "Not recorded";
 
+    const operatorGuidance = getOperatorClaimGuidance(
+      detectedDelay.operator || commute?.operator || seasonTicket?.operator
+    );
+
     const preparedSummary = `
 Delay Repay Claim Summary
 
 Claim status: prepared
+
+Operator-specific guidance:
+- Operator: ${operatorGuidance.operatorName}
+- Claim portal: ${operatorGuidance.claimPortal}
+- Delay threshold: ${operatorGuidance.delayThreshold}
+- Evidence needed: ${operatorGuidance.evidenceNeeded}
 
 Delay details:
 - Date: ${detectedDelay.delay_date || "Not recorded"}
@@ -290,8 +411,11 @@ Commute details:
 Passenger confirmation:
 - User confirmed they travelled on this delayed service.
 
+Suggested claim wording:
+${operatorGuidance.suggestedWording}
+
 Suggested next action:
-- Review this information, then use it to complete the operator's Delay Repay claim form.
+- Review this information, then use it to complete the ${operatorGuidance.claimPortal}.
 `.trim();
 
     const { data: updatedClaim, error: updateError } = await supabaseAdmin
