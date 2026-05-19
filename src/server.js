@@ -12,9 +12,24 @@ const app = express();
 app.use(helmet());
 app.use(express.json());
 
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://delaiapp.com",
+  "https://www.delaiapp.com",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS blocked origin: ${origin}`));
+      }
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -217,6 +232,11 @@ app.post("/prepare-claim", async (req, res) => {
 
     const commute = commutes?.[0] || null;
 
+    const delayRoute =
+      detectedDelay.origin_station && detectedDelay.destination_station
+        ? `${detectedDelay.origin_station} to ${detectedDelay.destination_station}`
+        : "Not recorded";
+
     const ticketRoute =
       seasonTicket?.origin_station && seasonTicket?.destination_station
         ? `${seasonTicket.origin_station} to ${seasonTicket.destination_station}`
@@ -238,11 +258,7 @@ Claim status: prepared
 
 Delay details:
 - Date: ${detectedDelay.delay_date || "Not recorded"}
-- Route: ${
-      detectedDelay.origin_station && detectedDelay.destination_station
-        ? `${detectedDelay.origin_station} to ${detectedDelay.destination_station}`
-        : "Not recorded"
-    }
+- Route: ${delayRoute}
 - Direction: ${detectedDelay.direction || "Not recorded"}
 - Travel window: ${detectedDelay.travel_window || "Not recorded"}
 - Scheduled time: ${detectedDelay.scheduled_time || "Not recorded"}
