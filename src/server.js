@@ -575,7 +575,9 @@ app.post("/mark-claim-submitted", async (req, res) => {
       details: error.message,
     });
   }
-});app.post("/update-claim-reference", async (req, res) => {
+});
+
+app.post("/update-claim-reference", async (req, res) => {
   try {
     const { user_id, claim_id, operator_reference } = req.body;
 
@@ -640,6 +642,77 @@ app.post("/mark-claim-submitted", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to update claim reference",
+      details: error.message,
+    });
+  }
+});
+
+app.post("/update-claim-outcome", async (req, res) => {
+  try {
+    const { user_id, claim_id, outcome } = req.body;
+
+    if (!user_id || !claim_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing user_id or claim_id",
+      });
+    }
+
+    const allowedOutcomes = ["paid", "rejected", "needs_follow_up"];
+
+    if (!outcome || !allowedOutcomes.includes(outcome)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid claim outcome",
+      });
+    }
+
+    const { data: claim, error: claimError } = await supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (claimError || !claim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim not found",
+      });
+    }
+
+    if (claim.status !== "submitted") {
+      return res.status(400).json({
+        success: false,
+        error: "Only submitted claims can have an outcome added.",
+      });
+    }
+
+    const { data: updatedClaim, error: updateError } = await supabaseAdmin
+      .from("claims")
+      .update({
+        outcome,
+        outcome_updated_at: new Date().toISOString(),
+      })
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    res.json({
+      success: true,
+      claim: updatedClaim,
+    });
+  } catch (error) {
+    console.error("Update claim outcome error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to update claim outcome",
       details: error.message,
     });
   }
