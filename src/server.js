@@ -512,6 +512,71 @@ app.post("/mark-claim-ready", async (req, res) => {
   }
 });
 
+app.post("/mark-claim-submitted", async (req, res) => {
+  try {
+    const { user_id, claim_id } = req.body;
+
+    if (!user_id || !claim_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing user_id or claim_id",
+      });
+    }
+
+    const { data: claim, error: claimError } = await supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (claimError || !claim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim not found",
+      });
+    }
+
+    if (claim.status !== "ready_to_submit" && claim.status !== "submitted") {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Claim must be ready to submit before it can be marked as submitted.",
+      });
+    }
+
+    const submittedAt = claim.submitted_at || new Date().toISOString();
+
+    const { data: updatedClaim, error: updateError } = await supabaseAdmin
+      .from("claims")
+      .update({
+        status: "submitted",
+        submitted_at: submittedAt,
+      })
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    res.json({
+      success: true,
+      claim: updatedClaim,
+    });
+  } catch (error) {
+    console.error("Mark claim submitted error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to mark claim as submitted",
+      details: error.message,
+    });
+  }
+});
+
 app.post("/early-access", async (req, res) => {
   try {
     const {
