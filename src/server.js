@@ -146,6 +146,54 @@ function getOperatorClaimGuidance(operatorName) {
   };
 }
 
+function detectClaimOutcomeFromText(claim) {
+  const textToCheck = [
+    claim.operator_response,
+    claim.outcome_notes,
+    claim.operator_reference,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  if (!textToCheck) {
+    return "still_waiting";
+  }
+
+  if (
+    textToCheck.includes("paid") ||
+    textToCheck.includes("payment") ||
+    textToCheck.includes("approved") ||
+    textToCheck.includes("compensation paid") ||
+    textToCheck.includes("claim successful")
+  ) {
+    return "paid";
+  }
+
+  if (
+    textToCheck.includes("rejected") ||
+    textToCheck.includes("declined") ||
+    textToCheck.includes("not eligible") ||
+    textToCheck.includes("unsuccessful") ||
+    textToCheck.includes("refused")
+  ) {
+    return "rejected";
+  }
+
+  if (
+    textToCheck.includes("more information") ||
+    textToCheck.includes("additional information") ||
+    textToCheck.includes("follow up") ||
+    textToCheck.includes("follow-up") ||
+    textToCheck.includes("evidence") ||
+    textToCheck.includes("provide proof")
+  ) {
+    return "needs_follow_up";
+  }
+
+  return "still_waiting";
+}
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -750,60 +798,7 @@ app.post("/check-claim-outcome", async (req, res) => {
       });
     }
 
-    /*
-      MVP automated outcome check.
-
-      Later this can be connected to:
-      - operator emails
-      - claim reference numbers
-      - payment confirmation emails
-      - rejection emails
-      - requests for more information
-      - AI classification of operator replies
-      - scheduled background checks
-
-      For now, this checks available claim text and updates the outcome if it
-      finds a likely paid, rejected or follow-up result.
-    */
-
-    const textToCheck = [
-      claim.operator_response,
-      claim.outcome_notes,
-      claim.prepared_summary,
-      claim.operator_reference,
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-
-    let detectedOutcome = "still_waiting";
-
-    if (
-      textToCheck.includes("paid") ||
-      textToCheck.includes("payment") ||
-      textToCheck.includes("approved") ||
-      textToCheck.includes("compensation") ||
-      textToCheck.includes("successful")
-    ) {
-      detectedOutcome = "paid";
-    } else if (
-      textToCheck.includes("rejected") ||
-      textToCheck.includes("declined") ||
-      textToCheck.includes("not eligible") ||
-      textToCheck.includes("unsuccessful") ||
-      textToCheck.includes("refused")
-    ) {
-      detectedOutcome = "rejected";
-    } else if (
-      textToCheck.includes("more information") ||
-      textToCheck.includes("additional information") ||
-      textToCheck.includes("follow up") ||
-      textToCheck.includes("follow-up") ||
-      textToCheck.includes("evidence") ||
-      textToCheck.includes("provide proof")
-    ) {
-      detectedOutcome = "needs_follow_up";
-    }
+    const detectedOutcome = detectClaimOutcomeFromText(claim);
 
     if (detectedOutcome === "still_waiting") {
       return res.json({
@@ -841,6 +836,102 @@ app.post("/check-claim-outcome", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to check claim outcome",
+      details: error.message,
+    });
+  }
+});
+
+app.post("/check-submitted-claims", async (req, res) => {
+  try {
+    const { limit = 20 } = req.body || {};
+
+    const { data: claims, error: claimsError } = await supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("status", "submitted")
+      .is("outcome", null)
+      .order("submitted_at", { ascending: true })
+      .limit(limit);
+
+    if (claimsError) {
+      throw claimsError;
+    }
+
+    if (!claims || claims.length === 0) {
+      return res.json({
+        success: true,
+        checked_count: 0,
+        updated_count: 0,
+        message: "No submitted claims need outcome checking.",
+        results: [],
+      });
+    }
+
+    const results = [];
+    let updatedCount = 0;
+
+    for (const claim of claims) {
+      const detectedOutcome = detectClaimOutcomeFromText(claim);
+
+      if (detectedOutcome === "still_waiting") {
+        results.push({
+          claim_id: claim.id,
+          user_id: claim.user_id,
+          outcome: "still_waiting",
+          updated: false,
+          message: "No final outcome detected yet.",
+        });
+
+        continue;
+      }
+
+      const { data: updatedClaim, error: updateError } = await supabaseAdmin
+        .from("claims")
+        .update({
+          outcome: detectedOutcome,
+          outcome_updated_at: new Date().toISOString(),
+        })
+        .eq("id", claim.id)
+        .eq("user_id", claim.user_id)
+        .select("*")
+        .single();
+
+      if (updateError) {
+        results.push({
+          claim_id: claim.id,
+          user_id: claim.user_id,
+          outcome: detectedOutcome,
+          updated: false,
+          error: updateError.message,
+        });
+
+        continue;
+      }
+
+      updatedCount += 1;
+
+      results.push({
+        claim_id: claim.id,
+        user_id: claim.user_id,
+        outcome: detectedOutcome,
+        updated: true,
+        claim: updatedClaim,
+      });
+    }
+
+    res.json({
+      success: true,
+      checked_count: claims.length,
+      updated_count: updatedCount,
+      message: `Checked ${claims.length} submitted claim(s). Updated ${updatedCount}.`,
+      results,
+    });
+  } catch (error) {
+    console.error("Check submitted claims error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to check submitted claims",
       details: error.message,
     });
   }
