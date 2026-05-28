@@ -695,6 +695,86 @@ app.post("/update-claim-reference", async (req, res) => {
   }
 });
 
+app.post("/update-operator-response", async (req, res) => {
+  try {
+    const { user_id, claim_id, operator_response, outcome_notes } = req.body;
+
+    if (!user_id || !claim_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing user_id or claim_id",
+      });
+    }
+
+    const cleanOperatorResponse = operator_response?.trim() || "";
+    const cleanOutcomeNotes = outcome_notes?.trim() || "";
+
+    if (!cleanOperatorResponse && !cleanOutcomeNotes) {
+      return res.status(400).json({
+        success: false,
+        error: "Please provide an operator response or outcome note.",
+      });
+    }
+
+    const { data: claim, error: claimError } = await supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (claimError || !claim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim not found",
+      });
+    }
+
+    if (claim.status !== "submitted") {
+      return res.status(400).json({
+        success: false,
+        error: "Operator responses can only be added to submitted claims.",
+      });
+    }
+
+    const updatePayload = {};
+
+    if (cleanOperatorResponse) {
+      updatePayload.operator_response = cleanOperatorResponse;
+    }
+
+    if (cleanOutcomeNotes) {
+      updatePayload.outcome_notes = cleanOutcomeNotes;
+    }
+
+    const { data: updatedClaim, error: updateError } = await supabaseAdmin
+      .from("claims")
+      .update(updatePayload)
+      .eq("id", claim_id)
+      .eq("user_id", user_id)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    res.json({
+      success: true,
+      message: "Operator response saved.",
+      claim: updatedClaim,
+    });
+  } catch (error) {
+    console.error("Update operator response error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to update operator response",
+      details: error.message,
+    });
+  }
+});
+
 app.post("/update-claim-outcome", async (req, res) => {
   try {
     const { user_id, claim_id, outcome } = req.body;
@@ -851,6 +931,7 @@ app.post("/check-submitted-claims", async (req, res) => {
         error: "Unauthorized cron request",
       });
     }
+
     const { limit = 20 } = req.body || {};
 
     const { data: claims, error: claimsError } = await supabaseAdmin
