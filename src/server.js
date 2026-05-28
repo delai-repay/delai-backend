@@ -843,6 +843,14 @@ app.post("/check-claim-outcome", async (req, res) => {
 
 app.post("/check-submitted-claims", async (req, res) => {
   try {
+    const cronSecret = req.headers["x-cron-secret"];
+
+    if (process.env.CRON_SECRET && cronSecret !== process.env.CRON_SECRET) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized cron request",
+      });
+    }
     const { limit = 20 } = req.body || {};
 
     const { data: claims, error: claimsError } = await supabaseAdmin
