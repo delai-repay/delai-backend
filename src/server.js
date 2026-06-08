@@ -35,6 +35,18 @@ app.use(
   })
 );
 
+function withTimeout(promise, timeoutMs, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+        timeoutMs
+      )
+    ),
+  ]);
+}
+
 function getOperatorClaimGuidance(operatorName) {
   const operator = (operatorName || "").toLowerCase();
 
@@ -199,6 +211,47 @@ app.get("/health", (req, res) => {
     ok: true,
     service: "delai-backend",
   });
+});
+
+app.get("/supabase-health", async (req, res) => {
+  try {
+    console.log("Supabase health check started");
+
+    const { data, error } = await withTimeout(
+      supabaseAdmin.from("claims").select("id").limit(1),
+      10000,
+      "Supabase health check"
+    );
+
+    if (error) {
+      console.error("Supabase health check error:", error);
+
+      return res.status(500).json({
+        ok: false,
+        service: "delai-backend",
+        supabase: "error",
+        error: error.message,
+      });
+    }
+
+    console.log("Supabase health check successful");
+
+    return res.json({
+      ok: true,
+      service: "delai-backend",
+      supabase: "connected",
+      sample_count: data?.length || 0,
+    });
+  } catch (error) {
+    console.error("Supabase health check failed:", error);
+
+    return res.status(500).json({
+      ok: false,
+      service: "delai-backend",
+      supabase: "failed_or_timed_out",
+      error: error.message,
+    });
+  }
 });
 
 app.get("/detect-delays-test", async (req, res) => {
@@ -848,37 +901,76 @@ app.post("/update-claim-outcome", async (req, res) => {
 
 app.post("/check-claim-outcome", async (req, res) => {
   try {
+    console.log("Check claim outcome request received:", req.body);
+
     const { user_id, claim_id } = req.body;
 
     if (!user_id || !claim_id) {
+      console.log("Missing user_id or claim_id");
+
       return res.status(400).json({
         success: false,
         error: "Missing user_id or claim_id",
       });
     }
 
-    const { data: claim, error: claimError } = await supabaseAdmin
-      .from("claims")
-      .select("*")
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .single();
+    console.log("Looking up claim in Supabase:", {
+      user_id,
+      claim_id,
+    });
 
-    if (claimError || !claim) {
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .maybeSingle(),
+      10000,
+      "Claim lookup"
+    );
+
+    console.log("Claim lookup completed");
+
+    if (claimError) {
+      console.error("Claim lookup error:", claimError);
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to look up claim",
+        details: claimError.message,
+      });
+    }
+
+    if (!claim) {
+      console.log("Claim not found");
+
       return res.status(404).json({
         success: false,
         error: "Claim not found",
       });
     }
 
+    console.log("Claim found:", {
+      id: claim.id,
+      status: claim.status,
+      outcome: claim.outcome,
+      has_operator_response: Boolean(claim.operator_response),
+      has_outcome_notes: Boolean(claim.outcome_notes),
+      has_operator_reference: Boolean(claim.operator_reference),
+    });
+
     if (claim.status !== "submitted") {
       return res.status(400).json({
         success: false,
         error: "Only submitted claims can be checked for an outcome.",
+        current_status: claim.status,
       });
     }
 
     const detectedOutcome = detectClaimOutcomeFromText(claim);
+
+    console.log("Detected outcome:", detectedOutcome);
 
     if (detectedOutcome === "still_waiting") {
       return res.json({
@@ -889,22 +981,43 @@ app.post("/check-claim-outcome", async (req, res) => {
       });
     }
 
-    const { data: updatedClaim, error: updateError } = await supabaseAdmin
-      .from("claims")
-      .update({
-        outcome: detectedOutcome,
-        outcome_updated_at: new Date().toISOString(),
-      })
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .select("*")
-      .single();
+    console.log("Updating claim outcome:", detectedOutcome);
+
+    const { data: updatedClaim, error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          outcome: detectedOutcome,
+          outcome_updated_at: new Date().toISOString(),
+        })
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .maybeSingle(),
+      10000,
+      "Claim outcome update"
+    );
+
+    console.log("Claim outcome update completed");
 
     if (updateError) {
-      throw updateError;
+      console.error("Claim outcome update error:", updateError);
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to update claim outcome",
+        details: updateError.message,
+      });
     }
 
-    res.json({
+    if (!updatedClaim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim could not be updated",
+      });
+    }
+
+    return res.json({
       success: true,
       outcome: detectedOutcome,
       message: `Claim outcome detected: ${detectedOutcome}.`,
@@ -913,7 +1026,7 @@ app.post("/check-claim-outcome", async (req, res) => {
   } catch (error) {
     console.error("Check claim outcome error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: "Failed to check claim outcome",
       details: error.message,
