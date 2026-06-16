@@ -680,9 +680,13 @@ app.post("/mark-claim-submitted", async (req, res) => {
 
 app.post("/update-claim-reference", async (req, res) => {
   try {
+    console.log("Update claim reference request received:", req.body);
+
     const { user_id, claim_id, operator_reference } = req.body;
 
     if (!user_id || !claim_id) {
+      console.log("Missing user_id or claim_id");
+
       return res.status(400).json({
         success: false,
         error: "Missing user_id or claim_id",
@@ -690,6 +694,8 @@ app.post("/update-claim-reference", async (req, res) => {
     }
 
     if (!operator_reference || !operator_reference.trim()) {
+      console.log("Missing operator reference");
+
       return res.status(400).json({
         success: false,
         error: "Missing operator reference",
@@ -698,56 +704,108 @@ app.post("/update-claim-reference", async (req, res) => {
 
     const cleanReference = operator_reference.trim();
 
-    const { data: claim, error: claimError } = await supabaseAdmin
-      .from("claims")
-      .select("*")
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .single();
+    console.log("Looking up claim before saving reference:", {
+      user_id,
+      claim_id,
+      operator_reference: cleanReference,
+    });
 
-    if (claimError || !claim) {
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .maybeSingle(),
+      10000,
+      "Claim lookup for reference update"
+    );
+
+    console.log("Claim lookup for reference update completed");
+
+    if (claimError) {
+      console.error("Claim lookup error:", claimError);
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to look up claim",
+        details: claimError.message,
+      });
+    }
+
+    if (!claim) {
+      console.log("Claim not found for reference update");
+
       return res.status(404).json({
         success: false,
         error: "Claim not found",
       });
     }
 
+    console.log("Claim found for reference update:", {
+      id: claim.id,
+      status: claim.status,
+      existing_operator_reference: claim.operator_reference,
+    });
+
     if (claim.status !== "submitted") {
       return res.status(400).json({
         success: false,
         error: "Operator reference can only be added to submitted claims.",
+        current_status: claim.status,
       });
     }
 
-    const { data: updatedClaim, error: updateError } = await supabaseAdmin
-      .from("claims")
-      .update({
-        operator_reference: cleanReference,
-      })
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .select("*")
-      .single();
+    console.log("Saving operator reference:", cleanReference);
+
+    const { data: updatedClaim, error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          operator_reference: cleanReference,
+        })
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .maybeSingle(),
+      10000,
+      "Operator reference update"
+    );
+
+    console.log("Operator reference update completed");
 
     if (updateError) {
-      throw updateError;
+      console.error("Operator reference update error:", updateError);
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to update claim reference",
+        details: updateError.message,
+      });
     }
 
-    res.json({
+    if (!updatedClaim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim reference could not be updated",
+      });
+    }
+
+    return res.json({
       success: true,
+      message: "Operator claim reference saved.",
       claim: updatedClaim,
     });
   } catch (error) {
     console.error("Update claim reference error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: "Failed to update claim reference",
       details: error.message,
     });
   }
 });
-
 app.post("/update-operator-response", async (req, res) => {
   try {
     const { user_id, claim_id, operator_response, outcome_notes } = req.body;
