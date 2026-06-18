@@ -172,14 +172,18 @@ function detectClaimOutcomeFromText(claim) {
     return "still_waiting";
   }
 
+  // Priority order matters. Check follow-up and rejection before paid,
+  // so phrases like "payment cannot be made because the claim was rejected"
+  // do not accidentally become a paid claim.
   if (
-    textToCheck.includes("paid") ||
-    textToCheck.includes("payment") ||
-    textToCheck.includes("approved") ||
-    textToCheck.includes("compensation paid") ||
-    textToCheck.includes("claim successful")
+    textToCheck.includes("more information") ||
+    textToCheck.includes("additional information") ||
+    textToCheck.includes("follow up") ||
+    textToCheck.includes("follow-up") ||
+    textToCheck.includes("evidence") ||
+    textToCheck.includes("provide proof")
   ) {
-    return "paid";
+    return "needs_follow_up";
   }
 
   if (
@@ -193,17 +197,119 @@ function detectClaimOutcomeFromText(claim) {
   }
 
   if (
-    textToCheck.includes("more information") ||
-    textToCheck.includes("additional information") ||
-    textToCheck.includes("follow up") ||
-    textToCheck.includes("follow-up") ||
-    textToCheck.includes("evidence") ||
-    textToCheck.includes("provide proof")
+    textToCheck.includes("paid") ||
+    textToCheck.includes("payment") ||
+    textToCheck.includes("approved") ||
+    textToCheck.includes("compensation paid") ||
+    textToCheck.includes("claim successful")
   ) {
-    return "needs_follow_up";
+    return "paid";
   }
 
   return "still_waiting";
+}
+
+function getClaimOutcomeNotification(outcome) {
+  if (outcome === "paid") {
+    return {
+      type: "claim_paid",
+      title: "Claim paid",
+      message:
+        "Good news — your train delay claim appears to have been approved or paid.",
+    };
+  }
+
+  if (outcome === "rejected") {
+    return {
+      type: "claim_rejected",
+      title: "Claim rejected",
+      message:
+        "Your train delay claim appears to have been rejected. You may need to review the reason or provide further evidence.",
+    };
+  }
+
+  if (outcome === "needs_follow_up") {
+    return {
+      type: "claim_needs_follow_up",
+      title: "Claim needs follow-up",
+      message:
+        "The train operator appears to need more information or evidence before your claim can progress.",
+    };
+  }
+
+  return null;
+}
+
+async function createClaimNotification({
+  userId,
+  claimId,
+  type,
+  title,
+  message,
+}) {
+  console.log("Creating claim notification:", {
+    userId,
+    claimId,
+    type,
+  });
+
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("notifications")
+      .insert([
+        {
+          user_id: userId,
+          claim_id: claimId,
+          type,
+          title,
+          message,
+          read: false,
+        },
+      ])
+      .select("*")
+      .single(),
+    10000,
+    "Create claim notification"
+  );
+
+  if (error) {
+    console.error("Create claim notification error:", error);
+    throw error;
+  }
+
+  console.log("Claim notification created:", data?.id);
+  return data;
+}
+
+async function createNotificationForOutcomeChange({
+  userId,
+  claimId,
+  previousOutcome,
+  newOutcome,
+}) {
+  const notificationDetails = getClaimOutcomeNotification(newOutcome);
+
+  if (!notificationDetails) {
+    console.log("No notification needed for outcome:", newOutcome);
+    return null;
+  }
+
+  if (previousOutcome === newOutcome) {
+    console.log("Outcome unchanged, skipping notification:", {
+      claimId,
+      previousOutcome,
+      newOutcome,
+    });
+    return null;
+  }
+
+  return createClaimNotification({
+    userId,
+    claimId,
+    type: notificationDetails.type,
+    title: notificationDetails.title,
+    message: notificationDetails.message,
+  });
 }
 
 app.get("/health", (req, res) => {
@@ -942,6 +1048,20 @@ app.post("/update-claim-outcome", async (req, res) => {
       throw updateError;
     }
 
+    try {
+      await createNotificationForOutcomeChange({
+        userId: user_id,
+        claimId: claim_id,
+        previousOutcome: claim.outcome,
+        newOutcome: outcome,
+      });
+    } catch (notificationError) {
+      console.error(
+        "Manual outcome notification failed, but claim outcome was updated:",
+        notificationError
+      );
+    }
+
     res.json({
       success: true,
       claim: updatedClaim,
@@ -1075,6 +1195,20 @@ app.post("/check-claim-outcome", async (req, res) => {
       });
     }
 
+    try {
+      await createNotificationForOutcomeChange({
+        userId: user_id,
+        claimId: claim_id,
+        previousOutcome: claim.outcome,
+        newOutcome: detectedOutcome,
+      });
+    } catch (notificationError) {
+      console.error(
+        "Outcome notification failed, but claim outcome was updated:",
+        notificationError
+      );
+    }
+
     return res.json({
       success: true,
       outcome: detectedOutcome,
@@ -1166,6 +1300,20 @@ app.post("/check-submitted-claims", async (req, res) => {
         });
 
         continue;
+      }
+
+      try {
+        await createNotificationForOutcomeChange({
+          userId: claim.user_id,
+          claimId: claim.id,
+          previousOutcome: claim.outcome,
+          newOutcome: detectedOutcome,
+        });
+      } catch (notificationError) {
+        console.error(
+          "Scheduled outcome notification failed, but claim outcome was updated:",
+          notificationError
+        );
       }
 
       updatedCount += 1;
