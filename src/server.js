@@ -31,9 +31,11 @@ app.use(
       }
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-cron-secret"],
   })
 );
+
+const FINAL_CLAIM_OUTCOMES = ["paid", "rejected", "needs_follow_up"];
 
 function withTimeout(promise, timeoutMs, label) {
   return Promise.race([
@@ -45,6 +47,16 @@ function withTimeout(promise, timeoutMs, label) {
       )
     ),
   ]);
+}
+
+function getSafeLimit(value, fallback = 20, max = 100) {
+  const parsed = Number.parseInt(value, 10);
+
+  if (Number.isNaN(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return Math.min(parsed, max);
 }
 
 function getOperatorClaimGuidance(operatorName) {
@@ -172,16 +184,19 @@ function detectClaimOutcomeFromText(claim) {
     return "still_waiting";
   }
 
-  // Priority order matters. Check follow-up and rejection before paid,
-  // so phrases like "payment cannot be made because the claim was rejected"
-  // do not accidentally become a paid claim.
   if (
     textToCheck.includes("more information") ||
     textToCheck.includes("additional information") ||
     textToCheck.includes("follow up") ||
     textToCheck.includes("follow-up") ||
     textToCheck.includes("evidence") ||
-    textToCheck.includes("provide proof")
+    textToCheck.includes("provide proof") ||
+    textToCheck.includes("proof of travel") ||
+    textToCheck.includes("need proof") ||
+    textToCheck.includes("need evidence") ||
+    textToCheck.includes("please provide") ||
+    textToCheck.includes("further information") ||
+    textToCheck.includes("further evidence")
   ) {
     return "needs_follow_up";
   }
@@ -191,7 +206,11 @@ function detectClaimOutcomeFromText(claim) {
     textToCheck.includes("declined") ||
     textToCheck.includes("not eligible") ||
     textToCheck.includes("unsuccessful") ||
-    textToCheck.includes("refused")
+    textToCheck.includes("refused") ||
+    textToCheck.includes("cannot be paid") ||
+    textToCheck.includes("cannot pay") ||
+    textToCheck.includes("not valid") ||
+    textToCheck.includes("invalid claim")
   ) {
     return "rejected";
   }
@@ -201,7 +220,10 @@ function detectClaimOutcomeFromText(claim) {
     textToCheck.includes("payment") ||
     textToCheck.includes("approved") ||
     textToCheck.includes("compensation paid") ||
-    textToCheck.includes("claim successful")
+    textToCheck.includes("claim successful") ||
+    textToCheck.includes("successful claim") ||
+    textToCheck.includes("refund issued") ||
+    textToCheck.includes("compensation has been issued")
   ) {
     return "paid";
   }
@@ -240,6 +262,28 @@ function getClaimOutcomeNotification(outcome) {
   return null;
 }
 
+async function findExistingClaimNotification({ userId, claimId, type }) {
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("notifications")
+      .select("id, type, created_at")
+      .eq("user_id", userId)
+      .eq("claim_id", claimId)
+      .eq("type", type)
+      .order("created_at", { ascending: false })
+      .limit(1),
+    10000,
+    "Existing notification lookup"
+  );
+
+  if (error) {
+    console.error("Existing notification lookup error:", error);
+    throw error;
+  }
+
+  return data?.[0] || null;
+}
+
 async function createClaimNotification({
   userId,
   claimId,
@@ -252,6 +296,26 @@ async function createClaimNotification({
     claimId,
     type,
   });
+
+  const existingNotification = await findExistingClaimNotification({
+    userId,
+    claimId,
+    type,
+  });
+
+  if (existingNotification) {
+    console.log("Duplicate notification skipped:", {
+      claimId,
+      type,
+      existingNotificationId: existingNotification.id,
+    });
+
+    return {
+      skipped: true,
+      reason: "duplicate_notification",
+      notification: existingNotification,
+    };
+  }
 
   const { data, error } = await withTimeout(
     supabaseAdmin
@@ -278,7 +342,11 @@ async function createClaimNotification({
   }
 
   console.log("Claim notification created:", data?.id);
-  return data;
+
+  return {
+    skipped: false,
+    notification: data,
+  };
 }
 
 async function createNotificationForOutcomeChange({
@@ -291,7 +359,10 @@ async function createNotificationForOutcomeChange({
 
   if (!notificationDetails) {
     console.log("No notification needed for outcome:", newOutcome);
-    return null;
+    return {
+      skipped: true,
+      reason: "non_final_outcome",
+    };
   }
 
   if (previousOutcome === newOutcome) {
@@ -300,7 +371,11 @@ async function createNotificationForOutcomeChange({
       previousOutcome,
       newOutcome,
     });
-    return null;
+
+    return {
+      skipped: true,
+      reason: "outcome_unchanged",
+    };
   }
 
   return createClaimNotification({
@@ -362,9 +437,11 @@ app.get("/supabase-health", async (req, res) => {
 
 app.get("/detect-delays-test", async (req, res) => {
   try {
-    const { data: commutes, error: commuteError } = await supabaseAdmin
-      .from("commutes")
-      .select("*");
+    const { data: commutes, error: commuteError } = await withTimeout(
+      supabaseAdmin.from("commutes").select("*"),
+      10000,
+      "Delay detection test commute lookup"
+    );
 
     if (commuteError) {
       throw commuteError;
@@ -388,9 +465,11 @@ app.get("/detect-delays-test", async (req, res) => {
 
 app.post("/detect-delays", async (req, res) => {
   try {
-    const { data: commutes, error: commuteError } = await supabaseAdmin
-      .from("commutes")
-      .select("*");
+    const { data: commutes, error: commuteError } = await withTimeout(
+      supabaseAdmin.from("commutes").select("*"),
+      10000,
+      "Delay detection commute lookup"
+    );
 
     if (commuteError) {
       throw commuteError;
@@ -440,14 +519,18 @@ app.post("/detect-delays", async (req, res) => {
         updated_at: new Date().toISOString(),
       };
 
-      const { data: existingDelay, error: existingError } = await supabaseAdmin
-        .from("detected_delays")
-        .select("id")
-        .eq("user_id", commute.user_id)
-        .eq("commute_id", commute.id)
-        .eq("delay_date", todayDate)
-        .eq("direction", "outbound")
-        .maybeSingle();
+      const { data: existingDelay, error: existingError } = await withTimeout(
+        supabaseAdmin
+          .from("detected_delays")
+          .select("id")
+          .eq("user_id", commute.user_id)
+          .eq("commute_id", commute.id)
+          .eq("delay_date", todayDate)
+          .eq("direction", "outbound")
+          .maybeSingle(),
+        10000,
+        "Existing delay lookup"
+      );
 
       if (existingError) {
         throw existingError;
@@ -457,11 +540,15 @@ app.post("/detect-delays", async (req, res) => {
         continue;
       }
 
-      const { data: insertedDelay, error: insertError } = await supabaseAdmin
-        .from("detected_delays")
-        .insert(testDelay)
-        .select("*")
-        .single();
+      const { data: insertedDelay, error: insertError } = await withTimeout(
+        supabaseAdmin
+          .from("detected_delays")
+          .insert(testDelay)
+          .select("*")
+          .single(),
+        10000,
+        "Detected delay insert"
+      );
 
       if (insertError) {
         throw insertError;
@@ -498,12 +585,16 @@ app.post("/prepare-claim", async (req, res) => {
       });
     }
 
-    const { data: claim, error: claimError } = await supabaseAdmin
-      .from("claims")
-      .select("*")
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .single();
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .single(),
+      10000,
+      "Prepare claim lookup"
+    );
 
     if (claimError || !claim) {
       return res.status(404).json({
@@ -512,12 +603,16 @@ app.post("/prepare-claim", async (req, res) => {
       });
     }
 
-    const { data: detectedDelay, error: delayError } = await supabaseAdmin
-      .from("detected_delays")
-      .select("*")
-      .eq("id", claim.detected_delay_id)
-      .eq("user_id", user_id)
-      .single();
+    const { data: detectedDelay, error: delayError } = await withTimeout(
+      supabaseAdmin
+        .from("detected_delays")
+        .select("*")
+        .eq("id", claim.detected_delay_id)
+        .eq("user_id", user_id)
+        .single(),
+      10000,
+      "Prepare claim linked delay lookup"
+    );
 
     if (delayError || !detectedDelay) {
       return res.status(404).json({
@@ -526,12 +621,16 @@ app.post("/prepare-claim", async (req, res) => {
       });
     }
 
-    const { data: seasonTickets, error: ticketError } = await supabaseAdmin
-      .from("season_tickets")
-      .select("*")
-      .eq("user_id", user_id)
-      .order("created_at", { ascending: false })
-      .limit(1);
+    const { data: seasonTickets, error: ticketError } = await withTimeout(
+      supabaseAdmin
+        .from("season_tickets")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", { ascending: false })
+        .limit(1),
+      10000,
+      "Prepare claim season ticket lookup"
+    );
 
     if (ticketError) {
       throw ticketError;
@@ -539,12 +638,16 @@ app.post("/prepare-claim", async (req, res) => {
 
     const seasonTicket = seasonTickets?.[0] || null;
 
-    const { data: commutes, error: commuteError } = await supabaseAdmin
-      .from("commutes")
-      .select("*")
-      .eq("user_id", user_id)
-      .order("created_at", { ascending: false })
-      .limit(1);
+    const { data: commutes, error: commuteError } = await withTimeout(
+      supabaseAdmin
+        .from("commutes")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", { ascending: false })
+        .limit(1),
+      10000,
+      "Prepare claim commute lookup"
+    );
 
     if (commuteError) {
       throw commuteError;
@@ -625,17 +728,21 @@ Suggested next action:
 - Review this information, then use it to complete the ${operatorGuidance.claimPortal}.
 `.trim();
 
-    const { data: updatedClaim, error: updateError } = await supabaseAdmin
-      .from("claims")
-      .update({
-        status: "prepared",
-        prepared_summary: preparedSummary,
-        prepared_at: new Date().toISOString(),
-      })
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .select("*")
-      .single();
+    const { data: updatedClaim, error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "prepared",
+          prepared_summary: preparedSummary,
+          prepared_at: new Date().toISOString(),
+        })
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Prepare claim update"
+    );
 
     if (updateError) {
       throw updateError;
@@ -668,12 +775,16 @@ app.post("/mark-claim-ready", async (req, res) => {
       });
     }
 
-    const { data: claim, error: claimError } = await supabaseAdmin
-      .from("claims")
-      .select("*")
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .single();
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .single(),
+      10000,
+      "Mark claim ready lookup"
+    );
 
     if (claimError || !claim) {
       return res.status(404).json({
@@ -690,15 +801,19 @@ app.post("/mark-claim-ready", async (req, res) => {
       });
     }
 
-    const { data: updatedClaim, error: updateError } = await supabaseAdmin
-      .from("claims")
-      .update({
-        status: "ready_to_submit",
-      })
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .select("*")
-      .single();
+    const { data: updatedClaim, error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "ready_to_submit",
+        })
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Mark claim ready update"
+    );
 
     if (updateError) {
       throw updateError;
@@ -730,12 +845,16 @@ app.post("/mark-claim-submitted", async (req, res) => {
       });
     }
 
-    const { data: claim, error: claimError } = await supabaseAdmin
-      .from("claims")
-      .select("*")
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .single();
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .single(),
+      10000,
+      "Mark claim submitted lookup"
+    );
 
     if (claimError || !claim) {
       return res.status(404).json({
@@ -754,16 +873,20 @@ app.post("/mark-claim-submitted", async (req, res) => {
 
     const submittedAt = claim.submitted_at || new Date().toISOString();
 
-    const { data: updatedClaim, error: updateError } = await supabaseAdmin
-      .from("claims")
-      .update({
-        status: "submitted",
-        submitted_at: submittedAt,
-      })
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .select("*")
-      .single();
+    const { data: updatedClaim, error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "submitted",
+          submitted_at: submittedAt,
+        })
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Mark claim submitted update"
+    );
 
     if (updateError) {
       throw updateError;
@@ -791,8 +914,6 @@ app.post("/update-claim-reference", async (req, res) => {
     const { user_id, claim_id, operator_reference } = req.body;
 
     if (!user_id || !claim_id) {
-      console.log("Missing user_id or claim_id");
-
       return res.status(400).json({
         success: false,
         error: "Missing user_id or claim_id",
@@ -800,8 +921,6 @@ app.post("/update-claim-reference", async (req, res) => {
     }
 
     if (!operator_reference || !operator_reference.trim()) {
-      console.log("Missing operator reference");
-
       return res.status(400).json({
         success: false,
         error: "Missing operator reference",
@@ -809,12 +928,6 @@ app.post("/update-claim-reference", async (req, res) => {
     }
 
     const cleanReference = operator_reference.trim();
-
-    console.log("Looking up claim before saving reference:", {
-      user_id,
-      claim_id,
-      operator_reference: cleanReference,
-    });
 
     const { data: claim, error: claimError } = await withTimeout(
       supabaseAdmin
@@ -827,11 +940,7 @@ app.post("/update-claim-reference", async (req, res) => {
       "Claim lookup for reference update"
     );
 
-    console.log("Claim lookup for reference update completed");
-
     if (claimError) {
-      console.error("Claim lookup error:", claimError);
-
       return res.status(500).json({
         success: false,
         error: "Failed to look up claim",
@@ -840,19 +949,11 @@ app.post("/update-claim-reference", async (req, res) => {
     }
 
     if (!claim) {
-      console.log("Claim not found for reference update");
-
       return res.status(404).json({
         success: false,
         error: "Claim not found",
       });
     }
-
-    console.log("Claim found for reference update:", {
-      id: claim.id,
-      status: claim.status,
-      existing_operator_reference: claim.operator_reference,
-    });
 
     if (claim.status !== "submitted") {
       return res.status(400).json({
@@ -861,8 +962,6 @@ app.post("/update-claim-reference", async (req, res) => {
         current_status: claim.status,
       });
     }
-
-    console.log("Saving operator reference:", cleanReference);
 
     const { data: updatedClaim, error: updateError } = await withTimeout(
       supabaseAdmin
@@ -878,11 +977,7 @@ app.post("/update-claim-reference", async (req, res) => {
       "Operator reference update"
     );
 
-    console.log("Operator reference update completed");
-
     if (updateError) {
-      console.error("Operator reference update error:", updateError);
-
       return res.status(500).json({
         success: false,
         error: "Failed to update claim reference",
@@ -912,6 +1007,7 @@ app.post("/update-claim-reference", async (req, res) => {
     });
   }
 });
+
 app.post("/update-operator-response", async (req, res) => {
   try {
     const { user_id, claim_id, operator_response, outcome_notes } = req.body;
@@ -933,12 +1029,16 @@ app.post("/update-operator-response", async (req, res) => {
       });
     }
 
-    const { data: claim, error: claimError } = await supabaseAdmin
-      .from("claims")
-      .select("*")
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .single();
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .single(),
+      10000,
+      "Operator response claim lookup"
+    );
 
     if (claimError || !claim) {
       return res.status(404).json({
@@ -964,13 +1064,17 @@ app.post("/update-operator-response", async (req, res) => {
       updatePayload.outcome_notes = cleanOutcomeNotes;
     }
 
-    const { data: updatedClaim, error: updateError } = await supabaseAdmin
-      .from("claims")
-      .update(updatePayload)
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .select("*")
-      .single();
+    const { data: updatedClaim, error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update(updatePayload)
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Operator response update"
+    );
 
     if (updateError) {
       throw updateError;
@@ -1003,21 +1107,23 @@ app.post("/update-claim-outcome", async (req, res) => {
       });
     }
 
-    const allowedOutcomes = ["paid", "rejected", "needs_follow_up"];
-
-    if (!outcome || !allowedOutcomes.includes(outcome)) {
+    if (!outcome || !FINAL_CLAIM_OUTCOMES.includes(outcome)) {
       return res.status(400).json({
         success: false,
         error: "Invalid claim outcome",
       });
     }
 
-    const { data: claim, error: claimError } = await supabaseAdmin
-      .from("claims")
-      .select("*")
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .single();
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .single(),
+      10000,
+      "Manual outcome claim lookup"
+    );
 
     if (claimError || !claim) {
       return res.status(404).json({
@@ -1033,23 +1139,29 @@ app.post("/update-claim-outcome", async (req, res) => {
       });
     }
 
-    const { data: updatedClaim, error: updateError } = await supabaseAdmin
-      .from("claims")
-      .update({
-        outcome,
-        outcome_updated_at: new Date().toISOString(),
-      })
-      .eq("id", claim_id)
-      .eq("user_id", user_id)
-      .select("*")
-      .single();
+    const { data: updatedClaim, error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          outcome,
+          outcome_updated_at: new Date().toISOString(),
+        })
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Manual outcome update"
+    );
 
     if (updateError) {
       throw updateError;
     }
 
+    let notificationResult = null;
+
     try {
-      await createNotificationForOutcomeChange({
+      notificationResult = await createNotificationForOutcomeChange({
         userId: user_id,
         claimId: claim_id,
         previousOutcome: claim.outcome,
@@ -1060,11 +1172,18 @@ app.post("/update-claim-outcome", async (req, res) => {
         "Manual outcome notification failed, but claim outcome was updated:",
         notificationError
       );
+
+      notificationResult = {
+        skipped: true,
+        reason: "notification_failed",
+        error: notificationError.message,
+      };
     }
 
     res.json({
       success: true,
       claim: updatedClaim,
+      notification: notificationResult,
     });
   } catch (error) {
     console.error("Update claim outcome error:", error);
@@ -1084,18 +1203,11 @@ app.post("/check-claim-outcome", async (req, res) => {
     const { user_id, claim_id } = req.body;
 
     if (!user_id || !claim_id) {
-      console.log("Missing user_id or claim_id");
-
       return res.status(400).json({
         success: false,
         error: "Missing user_id or claim_id",
       });
     }
-
-    console.log("Looking up claim in Supabase:", {
-      user_id,
-      claim_id,
-    });
 
     const { data: claim, error: claimError } = await withTimeout(
       supabaseAdmin
@@ -1108,11 +1220,7 @@ app.post("/check-claim-outcome", async (req, res) => {
       "Claim lookup"
     );
 
-    console.log("Claim lookup completed");
-
     if (claimError) {
-      console.error("Claim lookup error:", claimError);
-
       return res.status(500).json({
         success: false,
         error: "Failed to look up claim",
@@ -1121,22 +1229,11 @@ app.post("/check-claim-outcome", async (req, res) => {
     }
 
     if (!claim) {
-      console.log("Claim not found");
-
       return res.status(404).json({
         success: false,
         error: "Claim not found",
       });
     }
-
-    console.log("Claim found:", {
-      id: claim.id,
-      status: claim.status,
-      outcome: claim.outcome,
-      has_operator_response: Boolean(claim.operator_response),
-      has_outcome_notes: Boolean(claim.outcome_notes),
-      has_operator_reference: Boolean(claim.operator_reference),
-    });
 
     if (claim.status !== "submitted") {
       return res.status(400).json({
@@ -1148,18 +1245,25 @@ app.post("/check-claim-outcome", async (req, res) => {
 
     const detectedOutcome = detectClaimOutcomeFromText(claim);
 
-    console.log("Detected outcome:", detectedOutcome);
-
     if (detectedOutcome === "still_waiting") {
       return res.json({
         success: true,
         outcome: "still_waiting",
+        updated: false,
         message: "No final outcome detected yet. Delai will keep checking.",
         claim,
       });
     }
 
-    console.log("Updating claim outcome:", detectedOutcome);
+    if (claim.outcome === detectedOutcome) {
+      return res.json({
+        success: true,
+        outcome: detectedOutcome,
+        updated: false,
+        message: "Claim outcome was already up to date.",
+        claim,
+      });
+    }
 
     const { data: updatedClaim, error: updateError } = await withTimeout(
       supabaseAdmin
@@ -1176,11 +1280,7 @@ app.post("/check-claim-outcome", async (req, res) => {
       "Claim outcome update"
     );
 
-    console.log("Claim outcome update completed");
-
     if (updateError) {
-      console.error("Claim outcome update error:", updateError);
-
       return res.status(500).json({
         success: false,
         error: "Failed to update claim outcome",
@@ -1195,8 +1295,10 @@ app.post("/check-claim-outcome", async (req, res) => {
       });
     }
 
+    let notificationResult = null;
+
     try {
-      await createNotificationForOutcomeChange({
+      notificationResult = await createNotificationForOutcomeChange({
         userId: user_id,
         claimId: claim_id,
         previousOutcome: claim.outcome,
@@ -1207,13 +1309,21 @@ app.post("/check-claim-outcome", async (req, res) => {
         "Outcome notification failed, but claim outcome was updated:",
         notificationError
       );
+
+      notificationResult = {
+        skipped: true,
+        reason: "notification_failed",
+        error: notificationError.message,
+      };
     }
 
     return res.json({
       success: true,
       outcome: detectedOutcome,
+      updated: true,
       message: `Claim outcome detected: ${detectedOutcome}.`,
       claim: updatedClaim,
+      notification: notificationResult,
     });
   } catch (error) {
     console.error("Check claim outcome error:", error);
@@ -1226,7 +1336,170 @@ app.post("/check-claim-outcome", async (req, res) => {
   }
 });
 
-app.post("/check-submitted-claims", async (req, res) => {
+async function checkSubmittedClaims({ limit }) {
+  const safeLimit = getSafeLimit(limit, 20, 100);
+
+  console.log("Checking submitted claims:", {
+    limit: safeLimit,
+  });
+
+  const { data: claims, error: claimsError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("status", "submitted")
+      .or("outcome.is.null,outcome.eq.still_waiting")
+      .order("submitted_at", { ascending: true })
+      .limit(safeLimit),
+    15000,
+    "Submitted claims lookup"
+  );
+
+  if (claimsError) {
+    throw claimsError;
+  }
+
+  if (!claims || claims.length === 0) {
+    return {
+      success: true,
+      checked_count: 0,
+      updated_count: 0,
+      notification_count: 0,
+      message: "No submitted claims need outcome checking.",
+      results: [],
+    };
+  }
+
+  const results = [];
+  let updatedCount = 0;
+  let notificationCount = 0;
+
+  for (const claim of claims) {
+    try {
+      const detectedOutcome = detectClaimOutcomeFromText(claim);
+
+      if (detectedOutcome === "still_waiting") {
+        results.push({
+          claim_id: claim.id,
+          user_id: claim.user_id,
+          previous_outcome: claim.outcome,
+          detected_outcome: "still_waiting",
+          updated: false,
+          notification_created: false,
+          message: "No final outcome detected yet.",
+        });
+
+        continue;
+      }
+
+      if (claim.outcome === detectedOutcome) {
+        results.push({
+          claim_id: claim.id,
+          user_id: claim.user_id,
+          previous_outcome: claim.outcome,
+          detected_outcome: detectedOutcome,
+          updated: false,
+          notification_created: false,
+          message: "Outcome already up to date.",
+        });
+
+        continue;
+      }
+
+      const { data: updatedClaim, error: updateError } = await withTimeout(
+        supabaseAdmin
+          .from("claims")
+          .update({
+            outcome: detectedOutcome,
+            outcome_updated_at: new Date().toISOString(),
+          })
+          .eq("id", claim.id)
+          .eq("user_id", claim.user_id)
+          .select("*")
+          .single(),
+        10000,
+        `Scheduled claim outcome update ${claim.id}`
+      );
+
+      if (updateError) {
+        results.push({
+          claim_id: claim.id,
+          user_id: claim.user_id,
+          previous_outcome: claim.outcome,
+          detected_outcome: detectedOutcome,
+          updated: false,
+          notification_created: false,
+          error: updateError.message,
+        });
+
+        continue;
+      }
+
+      let notificationResult = null;
+
+      try {
+        notificationResult = await createNotificationForOutcomeChange({
+          userId: claim.user_id,
+          claimId: claim.id,
+          previousOutcome: claim.outcome,
+          newOutcome: detectedOutcome,
+        });
+
+        if (notificationResult && notificationResult.skipped === false) {
+          notificationCount += 1;
+        }
+      } catch (notificationError) {
+        console.error(
+          "Scheduled outcome notification failed, but claim outcome was updated:",
+          notificationError
+        );
+
+        notificationResult = {
+          skipped: true,
+          reason: "notification_failed",
+          error: notificationError.message,
+        };
+      }
+
+      updatedCount += 1;
+
+      results.push({
+        claim_id: claim.id,
+        user_id: claim.user_id,
+        previous_outcome: claim.outcome,
+        detected_outcome: detectedOutcome,
+        updated: true,
+        notification_created: notificationResult?.skipped === false,
+        notification: notificationResult,
+        claim: updatedClaim,
+      });
+    } catch (claimError) {
+      console.error("Submitted claim check failed for claim:", {
+        claim_id: claim.id,
+        error: claimError.message,
+      });
+
+      results.push({
+        claim_id: claim.id,
+        user_id: claim.user_id,
+        updated: false,
+        notification_created: false,
+        error: claimError.message,
+      });
+    }
+  }
+
+  return {
+    success: true,
+    checked_count: claims.length,
+    updated_count: updatedCount,
+    notification_count: notificationCount,
+    message: `Checked ${claims.length} submitted claim(s). Updated ${updatedCount}. Created ${notificationCount} notification(s).`,
+    results,
+  };
+}
+
+async function checkSubmittedClaimsHandler(req, res) {
   try {
     const cronSecret = req.headers["x-cron-secret"];
 
@@ -1237,113 +1510,26 @@ app.post("/check-submitted-claims", async (req, res) => {
       });
     }
 
-    const { limit = 20 } = req.body || {};
+    const limit = req.body?.limit || req.query?.limit || 20;
 
-    const { data: claims, error: claimsError } = await supabaseAdmin
-      .from("claims")
-      .select("*")
-      .eq("status", "submitted")
-      .is("outcome", null)
-      .order("submitted_at", { ascending: true })
-      .limit(limit);
-
-    if (claimsError) {
-      throw claimsError;
-    }
-
-    if (!claims || claims.length === 0) {
-      return res.json({
-        success: true,
-        checked_count: 0,
-        updated_count: 0,
-        message: "No submitted claims need outcome checking.",
-        results: [],
-      });
-    }
-
-    const results = [];
-    let updatedCount = 0;
-
-    for (const claim of claims) {
-      const detectedOutcome = detectClaimOutcomeFromText(claim);
-
-      if (detectedOutcome === "still_waiting") {
-        results.push({
-          claim_id: claim.id,
-          user_id: claim.user_id,
-          outcome: "still_waiting",
-          updated: false,
-          message: "No final outcome detected yet.",
-        });
-
-        continue;
-      }
-
-      const { data: updatedClaim, error: updateError } = await supabaseAdmin
-        .from("claims")
-        .update({
-          outcome: detectedOutcome,
-          outcome_updated_at: new Date().toISOString(),
-        })
-        .eq("id", claim.id)
-        .eq("user_id", claim.user_id)
-        .select("*")
-        .single();
-
-      if (updateError) {
-        results.push({
-          claim_id: claim.id,
-          user_id: claim.user_id,
-          outcome: detectedOutcome,
-          updated: false,
-          error: updateError.message,
-        });
-
-        continue;
-      }
-
-      try {
-        await createNotificationForOutcomeChange({
-          userId: claim.user_id,
-          claimId: claim.id,
-          previousOutcome: claim.outcome,
-          newOutcome: detectedOutcome,
-        });
-      } catch (notificationError) {
-        console.error(
-          "Scheduled outcome notification failed, but claim outcome was updated:",
-          notificationError
-        );
-      }
-
-      updatedCount += 1;
-
-      results.push({
-        claim_id: claim.id,
-        user_id: claim.user_id,
-        outcome: detectedOutcome,
-        updated: true,
-        claim: updatedClaim,
-      });
-    }
-
-    res.json({
-      success: true,
-      checked_count: claims.length,
-      updated_count: updatedCount,
-      message: `Checked ${claims.length} submitted claim(s). Updated ${updatedCount}.`,
-      results,
+    const result = await checkSubmittedClaims({
+      limit,
     });
+
+    return res.json(result);
   } catch (error) {
     console.error("Check submitted claims error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: "Failed to check submitted claims",
       details: error.message,
     });
   }
-});
+}
+
+app.post("/check-submitted-claims", checkSubmittedClaimsHandler);
+app.get("/check-submitted-claims", checkSubmittedClaimsHandler);
 
 app.post("/early-access", async (req, res) => {
   try {
