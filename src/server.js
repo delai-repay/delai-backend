@@ -262,6 +262,40 @@ function getClaimOutcomeNotification(outcome) {
   return null;
 }
 
+function calculateClaimPayment({ compensationAmount, feePercentage = 15 }) {
+  const cleanCompensationAmount = Number(compensationAmount);
+  const cleanFeePercentage = Number(feePercentage || 15);
+
+  if (
+    Number.isNaN(cleanCompensationAmount) ||
+    cleanCompensationAmount <= 0
+  ) {
+    throw new Error("Compensation amount must be greater than 0.");
+  }
+
+  if (
+    Number.isNaN(cleanFeePercentage) ||
+    cleanFeePercentage < 0 ||
+    cleanFeePercentage > 100
+  ) {
+    throw new Error("Fee percentage must be between 0 and 100.");
+  }
+
+  const delaiFeeAmount =
+    Math.round(cleanCompensationAmount * (cleanFeePercentage / 100) * 100) /
+    100;
+
+  const userPayoutAmount =
+    Math.round((cleanCompensationAmount - delaiFeeAmount) * 100) / 100;
+
+  return {
+    compensationAmount: cleanCompensationAmount,
+    feePercentage: cleanFeePercentage,
+    delaiFeeAmount,
+    userPayoutAmount,
+  };
+}
+
 async function findExistingClaimNotification({ userId, claimId, type }) {
   const { data, error } = await withTimeout(
     supabaseAdmin
@@ -1530,6 +1564,198 @@ async function checkSubmittedClaimsHandler(req, res) {
 
 app.post("/check-submitted-claims", checkSubmittedClaimsHandler);
 app.get("/check-submitted-claims", checkSubmittedClaimsHandler);
+
+app.post("/update-claim-payment", async (req, res) => {
+  try {
+    const {
+      user_id,
+      claim_id,
+      compensation_amount,
+      fee_percentage = 15,
+      payment_status = "fee_due",
+    } = req.body;
+
+    if (!user_id || !claim_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing user_id or claim_id",
+      });
+    }
+
+    if (compensation_amount === undefined || compensation_amount === null) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing compensation_amount",
+      });
+    }
+
+    const allowedPaymentStatuses = [
+      "not_paid",
+      "paid",
+      "fee_due",
+      "fee_collected",
+    ];
+
+    if (!allowedPaymentStatuses.includes(payment_status)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid payment_status",
+      });
+    }
+
+    const payment = calculateClaimPayment({
+      compensationAmount: compensation_amount,
+      feePercentage: fee_percentage,
+    });
+
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .maybeSingle(),
+      10000,
+      "Payment claim lookup"
+    );
+
+    if (claimError) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to look up claim",
+        details: claimError.message,
+      });
+    }
+
+    if (!claim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim not found",
+      });
+    }
+
+    if (claim.status !== "submitted") {
+      return res.status(400).json({
+        success: false,
+        error: "Payments can only be recorded for submitted claims.",
+        current_status: claim.status,
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    const { data: updatedClaim, error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          outcome: "paid",
+          outcome_updated_at: claim.outcome_updated_at || now,
+          compensation_amount: payment.compensationAmount,
+          fee_percentage: payment.feePercentage,
+          delai_fee_amount: payment.delaiFeeAmount,
+          user_payout_amount: payment.userPayoutAmount,
+          payment_status,
+          payment_recorded_at: now,
+        })
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .maybeSingle(),
+      10000,
+      "Claim payment update"
+    );
+
+    if (updateError) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to update claim payment",
+        details: updateError.message,
+      });
+    }
+
+    if (!updatedClaim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim payment could not be updated",
+      });
+    }
+
+    let outcomeNotification = null;
+    let paymentNotification = null;
+
+    try {
+      outcomeNotification = await createNotificationForOutcomeChange({
+        userId: user_id,
+        claimId: claim_id,
+        previousOutcome: claim.outcome,
+        newOutcome: "paid",
+      });
+    } catch (notificationError) {
+      console.error(
+        "Payment outcome notification failed, but payment was recorded:",
+        notificationError
+      );
+
+      outcomeNotification = {
+        skipped: true,
+        reason: "notification_failed",
+        error: notificationError.message,
+      };
+    }
+
+    try {
+      paymentNotification = await createClaimNotification({
+        userId: user_id,
+        claimId: claim_id,
+        type: "claim_payment_recorded",
+        title: "Payment recorded",
+        message: `A compensation payment of £${payment.compensationAmount.toFixed(
+          2
+        )} has been recorded. Delai's fee is £${payment.delaiFeeAmount.toFixed(
+          2
+        )}, leaving £${payment.userPayoutAmount.toFixed(
+          2
+        )} for the passenger.`,
+      });
+    } catch (notificationError) {
+      console.error(
+        "Payment notification failed, but payment was recorded:",
+        notificationError
+      );
+
+      paymentNotification = {
+        skipped: true,
+        reason: "notification_failed",
+        error: notificationError.message,
+      };
+    }
+
+    return res.json({
+      success: true,
+      message: "Claim payment recorded.",
+      claim: updatedClaim,
+      payment: {
+        compensation_amount: payment.compensationAmount,
+        fee_percentage: payment.feePercentage,
+        delai_fee_amount: payment.delaiFeeAmount,
+        user_payout_amount: payment.userPayoutAmount,
+        payment_status,
+      },
+      notifications: {
+        outcome: outcomeNotification,
+        payment: paymentNotification,
+      },
+    });
+  } catch (error) {
+    console.error("Update claim payment error:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to update claim payment",
+      details: error.message,
+    });
+  }
+});
 
 app.post("/early-access", async (req, res) => {
   try {
