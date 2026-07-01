@@ -7,11 +7,11 @@ const backendUrl =
 
 const cronSecret = process.env.CRON_SECRET;
 const timeoutMs = Number(process.env.CRON_TIMEOUT_MS || 30000);
-const claimLimit = Number(process.env.CRON_CLAIM_LIMIT || 20);
+const jobLimit = Number(process.env.CRON_JOB_LIMIT || 20);
 
 if (!cronSecret) {
   console.error("Missing CRON_SECRET environment variable.");
-  process.exit(1);
+  process.exitCode = 1;
 }
 
 function fetchWithTimeout(url, options = {}, timeout = 30000) {
@@ -33,7 +33,7 @@ async function readJsonResponse(response) {
 
   try {
     return JSON.parse(text);
-  } catch (error) {
+  } catch {
     return {
       success: false,
       error: "Backend returned non-JSON response.",
@@ -42,13 +42,17 @@ async function readJsonResponse(response) {
   }
 }
 
-async function checkSubmittedClaims() {
-  const endpoint = `${backendUrl}/check-submitted-claims`;
+async function processAutomationJobs() {
+  if (!cronSecret) {
+    return;
+  }
+
+  const endpoint = `${backendUrl}/process-automation-jobs`;
 
   try {
-    console.log("Checking submitted claims...");
+    console.log("Processing Delai automation jobs...");
     console.log("Backend:", backendUrl);
-    console.log("Limit:", claimLimit);
+    console.log("Limit:", jobLimit);
 
     const response = await fetchWithTimeout(
       endpoint,
@@ -59,7 +63,7 @@ async function checkSubmittedClaims() {
           "x-cron-secret": cronSecret,
         },
         body: JSON.stringify({
-          limit: claimLimit,
+          limit: jobLimit,
         }),
       },
       timeoutMs
@@ -68,44 +72,44 @@ async function checkSubmittedClaims() {
     const result = await readJsonResponse(response);
 
     if (!response.ok || !result.success) {
-      console.error("Submitted claims check failed.");
+      console.error("Automation job processing failed.");
       console.error("Status:", response.status);
       console.error("Result:", result);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
-    console.log("Submitted claims check completed successfully.");
-    console.log("Checked:", result.checked_count ?? 0);
-    console.log("Updated:", result.updated_count ?? 0);
-    console.log("Notifications:", result.notification_count ?? 0);
-    console.log("Message:", result.message || "No message returned.");
+    console.log("Automation job processing completed successfully.");
+    console.log("Queued submitted claims:", result.queued_submitted_claims);
+    console.log("Processed:", result.processed_count ?? 0);
+    console.log("Completed:", result.completed_count ?? 0);
+    console.log("Failed:", result.failed_count ?? 0);
 
     if (Array.isArray(result.results) && result.results.length > 0) {
       console.log("Results:");
 
       for (const item of result.results) {
         console.log({
+          job_id: item.job_id,
+          job_type: item.job_type,
           claim_id: item.claim_id,
-          user_id: item.user_id,
-          previous_outcome: item.previous_outcome,
-          detected_outcome: item.detected_outcome || item.outcome,
-          updated: item.updated,
-          notification_created: item.notification_created,
+          success: item.success,
+          result: item.result?.message || item.result?.outcome || null,
           error: item.error || null,
         });
       }
     }
 
-    process.exit(0);
+    process.exitCode = 0;
   } catch (error) {
     if (error.name === "AbortError") {
-      console.error(`Submitted claims check timed out after ${timeoutMs}ms.`);
+      console.error(`Automation job processing timed out after ${timeoutMs}ms.`);
     } else {
-      console.error("Submitted claims check error:", error);
+      console.error("Automation job processing error:", error);
     }
 
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
-checkSubmittedClaims();
+await processAutomationJobs();

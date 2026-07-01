@@ -37,6 +37,15 @@ app.use(
 
 const FINAL_CLAIM_OUTCOMES = ["paid", "rejected", "needs_follow_up"];
 
+const AUTOMATION_JOB_TYPES = [
+  "claim_check_outcome",
+  "claim_check_payment",
+  "claim_collect_fee",
+  "send_notification",
+];
+
+const AUTOMATION_RETRY_LIMIT = 3;
+
 function withTimeout(promise, timeoutMs, label) {
   return Promise.race([
     promise,
@@ -57,6 +66,16 @@ function getSafeLimit(value, fallback = 20, max = 100) {
   }
 
   return Math.min(parsed, max);
+}
+
+function getFutureIsoDate({ minutes = 0, hours = 0, days = 0 }) {
+  const date = new Date();
+
+  date.setMinutes(date.getMinutes() + minutes);
+  date.setHours(date.getHours() + hours);
+  date.setDate(date.getDate() + days);
+
+  return date.toISOString();
 }
 
 function getOperatorClaimGuidance(operatorName) {
@@ -229,6 +248,47 @@ function detectClaimOutcomeFromText(claim) {
   }
 
   return "still_waiting";
+}
+
+function extractCompensationAmountFromText(claim) {
+  const textToCheck = [claim.operator_response, claim.outcome_notes]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  if (!textToCheck) {
+    return null;
+  }
+
+  const matches = [];
+
+  const poundMatches = textToCheck.matchAll(/£\s*(\d+(?:\.\d{1,2})?)/g);
+  for (const match of poundMatches) {
+    matches.push(Number(match[1]));
+  }
+
+  const gbpMatches = textToCheck.matchAll(/gbp\s*(\d+(?:\.\d{1,2})?)/g);
+  for (const match of gbpMatches) {
+    matches.push(Number(match[1]));
+  }
+
+  const amountMatches = textToCheck.matchAll(
+    /(?:compensation|payment|refund|paid|approved)\D{0,20}(\d+(?:\.\d{1,2})?)/g
+  );
+
+  for (const match of amountMatches) {
+    matches.push(Number(match[1]));
+  }
+
+  const cleanMatches = matches.filter(
+    (value) => !Number.isNaN(value) && value > 0 && value < 10000
+  );
+
+  if (cleanMatches.length === 0) {
+    return null;
+  }
+
+  return Math.max(...cleanMatches);
 }
 
 function getClaimOutcomeNotification(outcome) {
@@ -419,6 +479,594 @@ async function createNotificationForOutcomeChange({
     title: notificationDetails.title,
     message: notificationDetails.message,
   });
+}
+
+async function queueAutomationJob({
+  userId,
+  claimId = null,
+  jobType,
+  runAfter = null,
+  force = false,
+}) {
+  if (!userId) {
+    throw new Error("Missing userId for automation job.");
+  }
+
+  if (!jobType || !AUTOMATION_JOB_TYPES.includes(jobType)) {
+    throw new Error("Invalid automation job type.");
+  }
+
+  if (!force && claimId) {
+    const { data: existingJobs, error: existingError } = await withTimeout(
+      supabaseAdmin
+        .from("automation_jobs")
+        .select("id, status, run_after")
+        .eq("user_id", userId)
+        .eq("claim_id", claimId)
+        .eq("job_type", jobType)
+        .in("status", ["queued", "retry", "processing"])
+        .order("created_at", { ascending: false })
+        .limit(1),
+      10000,
+      "Existing automation job lookup"
+    );
+
+    if (existingError) {
+      throw existingError;
+    }
+
+    if (existingJobs?.length > 0) {
+      return {
+        skipped: true,
+        reason: "existing_job",
+        job: existingJobs[0],
+      };
+    }
+  }
+
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("automation_jobs")
+      .insert([
+        {
+          user_id: userId,
+          claim_id: claimId,
+          job_type: jobType,
+          status: "queued",
+          run_after: runAfter || new Date().toISOString(),
+        },
+      ])
+      .select("*")
+      .single(),
+    10000,
+    "Queue automation job"
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return {
+    skipped: false,
+    job: data,
+  };
+}
+
+async function completeAutomationJob(jobId) {
+  const { error } = await withTimeout(
+    supabaseAdmin
+      .from("automation_jobs")
+      .update({
+        status: "completed",
+        completed_at: new Date().toISOString(),
+        last_error: null,
+      })
+      .eq("id", jobId),
+    10000,
+    "Complete automation job"
+  );
+
+  if (error) {
+    throw error;
+  }
+}
+
+async function failAutomationJob(job, error) {
+  const nextAttempts = Number(job.attempts || 0) + 1;
+  const shouldFail = nextAttempts >= AUTOMATION_RETRY_LIMIT;
+
+  const { error: updateError } = await withTimeout(
+    supabaseAdmin
+      .from("automation_jobs")
+      .update({
+        status: shouldFail ? "failed" : "retry",
+        attempts: nextAttempts,
+        last_error: error.message || "Unknown automation error",
+        run_after: shouldFail
+          ? job.run_after
+          : getFutureIsoDate({ minutes: 20 }),
+      })
+      .eq("id", job.id),
+    10000,
+    "Fail automation job"
+  );
+
+  if (updateError) {
+    console.error("Failed to update failed automation job:", updateError);
+  }
+}
+
+async function queueSubmittedClaimOutcomeJobs({ limit = 20 }) {
+  const safeLimit = getSafeLimit(limit, 20, 100);
+
+  const { data: claims, error } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("id, user_id, status, outcome")
+      .eq("status", "submitted")
+      .or("outcome.is.null,outcome.eq.still_waiting")
+      .order("submitted_at", { ascending: true })
+      .limit(safeLimit),
+    15000,
+    "Submitted claims automation lookup"
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  let queuedCount = 0;
+  let skippedCount = 0;
+
+  for (const claim of claims || []) {
+    const result = await queueAutomationJob({
+      userId: claim.user_id,
+      claimId: claim.id,
+      jobType: "claim_check_outcome",
+    });
+
+    if (result.skipped) {
+      skippedCount += 1;
+    } else {
+      queuedCount += 1;
+    }
+  }
+
+  return {
+    found_count: claims?.length || 0,
+    queued_count: queuedCount,
+    skipped_count: skippedCount,
+  };
+}
+
+async function processClaimCheckOutcomeJob(job) {
+  const { data: claim, error: claimError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", job.claim_id)
+      .eq("user_id", job.user_id)
+      .maybeSingle(),
+    10000,
+    "Automation outcome claim lookup"
+  );
+
+  if (claimError) {
+    throw claimError;
+  }
+
+  if (!claim) {
+    return {
+      success: true,
+      message: "Claim no longer exists.",
+    };
+  }
+
+  if (claim.status !== "submitted") {
+    return {
+      success: true,
+      message: `Claim is not submitted. Current status: ${claim.status}.`,
+    };
+  }
+
+  const detectedOutcome = detectClaimOutcomeFromText(claim);
+
+  if (detectedOutcome === "still_waiting") {
+    await queueAutomationJob({
+      userId: claim.user_id,
+      claimId: claim.id,
+      jobType: "claim_check_outcome",
+      runAfter: getFutureIsoDate({ hours: 24 }),
+      force: true,
+    });
+
+    return {
+      success: true,
+      outcome: "still_waiting",
+      updated: false,
+      message: "No final outcome detected. Queued another check.",
+    };
+  }
+
+  if (claim.outcome === detectedOutcome) {
+    if (detectedOutcome === "paid") {
+      await queueAutomationJob({
+        userId: claim.user_id,
+        claimId: claim.id,
+        jobType: "claim_check_payment",
+      });
+    }
+
+    return {
+      success: true,
+      outcome: detectedOutcome,
+      updated: false,
+      message: "Claim outcome already up to date.",
+    };
+  }
+
+  const { data: updatedClaim, error: updateError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .update({
+        outcome: detectedOutcome,
+        outcome_updated_at: new Date().toISOString(),
+      })
+      .eq("id", claim.id)
+      .eq("user_id", claim.user_id)
+      .select("*")
+      .single(),
+    10000,
+    "Automation claim outcome update"
+  );
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  let notificationResult = null;
+
+  try {
+    notificationResult = await createNotificationForOutcomeChange({
+      userId: claim.user_id,
+      claimId: claim.id,
+      previousOutcome: claim.outcome,
+      newOutcome: detectedOutcome,
+    });
+  } catch (notificationError) {
+    console.error(
+      "Automation outcome notification failed, but outcome was updated:",
+      notificationError
+    );
+
+    notificationResult = {
+      skipped: true,
+      reason: "notification_failed",
+      error: notificationError.message,
+    };
+  }
+
+  if (detectedOutcome === "paid") {
+    await queueAutomationJob({
+      userId: claim.user_id,
+      claimId: claim.id,
+      jobType: "claim_check_payment",
+    });
+  }
+
+  return {
+    success: true,
+    outcome: detectedOutcome,
+    updated: true,
+    notification: notificationResult,
+    claim: updatedClaim,
+  };
+}
+
+async function processClaimCheckPaymentJob(job) {
+  const { data: claim, error: claimError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", job.claim_id)
+      .eq("user_id", job.user_id)
+      .maybeSingle(),
+    10000,
+    "Automation payment claim lookup"
+  );
+
+  if (claimError) {
+    throw claimError;
+  }
+
+  if (!claim) {
+    return {
+      success: true,
+      message: "Claim no longer exists.",
+    };
+  }
+
+  if (claim.outcome !== "paid") {
+    return {
+      success: true,
+      message: "Claim has not been paid, so payment checking is not needed.",
+    };
+  }
+
+  if (claim.compensation_amount) {
+    if (claim.payment_status === "fee_due") {
+      await queueAutomationJob({
+        userId: claim.user_id,
+        claimId: claim.id,
+        jobType: "claim_collect_fee",
+      });
+    }
+
+    return {
+      success: true,
+      message: "Payment already recorded.",
+      compensation_amount: claim.compensation_amount,
+      payment_status: claim.payment_status,
+    };
+  }
+
+  const extractedAmount = extractCompensationAmountFromText(claim);
+
+  if (!extractedAmount) {
+    await queueAutomationJob({
+      userId: claim.user_id,
+      claimId: claim.id,
+      jobType: "claim_check_payment",
+      runAfter: getFutureIsoDate({ hours: 24 }),
+      force: true,
+    });
+
+    return {
+      success: true,
+      message:
+        "Claim is paid, but no compensation amount was detected yet. Queued another payment check.",
+    };
+  }
+
+  const payment = calculateClaimPayment({
+    compensationAmount: extractedAmount,
+    feePercentage: claim.fee_percentage || 10,
+  });
+
+  const now = new Date().toISOString();
+
+  const { data: updatedClaim, error: updateError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .update({
+        compensation_amount: payment.compensationAmount,
+        fee_percentage: payment.feePercentage,
+        delai_fee_amount: payment.delaiFeeAmount,
+        user_payout_amount: payment.userPayoutAmount,
+        payment_status: "fee_due",
+        payment_recorded_at: now,
+      })
+      .eq("id", claim.id)
+      .eq("user_id", claim.user_id)
+      .select("*")
+      .single(),
+    10000,
+    "Automation payment update"
+  );
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  let paymentNotification = null;
+
+  try {
+    paymentNotification = await createClaimNotification({
+      userId: claim.user_id,
+      claimId: claim.id,
+      type: "claim_payment_recorded",
+      title: "Payment recorded",
+      message: `A compensation payment of £${payment.compensationAmount.toFixed(
+        2
+      )} has been recorded. Delai's success fee is £${payment.delaiFeeAmount.toFixed(
+        2
+      )}, and you keep £${payment.userPayoutAmount.toFixed(2)}.`,
+    });
+  } catch (notificationError) {
+    console.error(
+      "Automation payment notification failed, but payment was recorded:",
+      notificationError
+    );
+
+    paymentNotification = {
+      skipped: true,
+      reason: "notification_failed",
+      error: notificationError.message,
+    };
+  }
+
+  await queueAutomationJob({
+    userId: claim.user_id,
+    claimId: claim.id,
+    jobType: "claim_collect_fee",
+  });
+
+  return {
+    success: true,
+    message: "Payment amount detected and recorded.",
+    payment,
+    notification: paymentNotification,
+    claim: updatedClaim,
+  };
+}
+
+async function processClaimCollectFeeJob(job) {
+  const { data: claim, error: claimError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", job.claim_id)
+      .eq("user_id", job.user_id)
+      .maybeSingle(),
+    10000,
+    "Automation fee claim lookup"
+  );
+
+  if (claimError) {
+    throw claimError;
+  }
+
+  if (!claim) {
+    return {
+      success: true,
+      message: "Claim no longer exists.",
+    };
+  }
+
+  if (claim.payment_status === "fee_collected") {
+    return {
+      success: true,
+      message: "Delai success fee has already been collected.",
+    };
+  }
+
+  if (claim.payment_status !== "fee_due") {
+    return {
+      success: true,
+      message: `Fee collection not ready. Current payment status: ${
+        claim.payment_status || "not_paid"
+      }.`,
+    };
+  }
+
+  await createClaimNotification({
+    userId: claim.user_id,
+    claimId: claim.id,
+    type: "claim_fee_due",
+    title: "Delai success fee due",
+    message: `Your claim compensation has been recorded. Delai's success fee is £${Number(
+      claim.delai_fee_amount || 0
+    ).toFixed(2)}.`,
+  });
+
+  return {
+    success: true,
+    message:
+      "Fee due notification created. Stripe fee collection will be connected next.",
+  };
+}
+
+async function processAutomationJob(job) {
+  if (job.job_type === "claim_check_outcome") {
+    return processClaimCheckOutcomeJob(job);
+  }
+
+  if (job.job_type === "claim_check_payment") {
+    return processClaimCheckPaymentJob(job);
+  }
+
+  if (job.job_type === "claim_collect_fee") {
+    return processClaimCollectFeeJob(job);
+  }
+
+  return {
+    success: true,
+    message: `No processor yet for job type: ${job.job_type}`,
+  };
+}
+
+async function processAutomationJobs({ limit = 20 }) {
+  const safeLimit = getSafeLimit(limit, 20, 100);
+
+  const queuedSubmittedClaims = await queueSubmittedClaimOutcomeJobs({
+    limit: safeLimit,
+  });
+
+  const { data: jobs, error: jobsError } = await withTimeout(
+    supabaseAdmin
+      .from("automation_jobs")
+      .select("*")
+      .in("status", ["queued", "retry"])
+      .lte("run_after", new Date().toISOString())
+      .order("run_after", { ascending: true })
+      .limit(safeLimit),
+    15000,
+    "Automation jobs lookup"
+  );
+
+  if (jobsError) {
+    throw jobsError;
+  }
+
+  const results = [];
+  let completedCount = 0;
+  let failedCount = 0;
+
+  for (const job of jobs || []) {
+    try {
+      const nextAttempts = Number(job.attempts || 0) + 1;
+
+      const { data: processingJob, error: processingError } = await withTimeout(
+        supabaseAdmin
+          .from("automation_jobs")
+          .update({
+            status: "processing",
+            attempts: nextAttempts,
+            last_error: null,
+          })
+          .eq("id", job.id)
+          .select("*")
+          .single(),
+        10000,
+        "Mark automation job processing"
+      );
+
+      if (processingError) {
+        throw processingError;
+      }
+
+      const result = await processAutomationJob(processingJob);
+
+      await completeAutomationJob(processingJob.id);
+
+      completedCount += 1;
+
+      results.push({
+        job_id: processingJob.id,
+        job_type: processingJob.job_type,
+        claim_id: processingJob.claim_id,
+        success: true,
+        result,
+      });
+    } catch (jobError) {
+      console.error("Automation job failed:", {
+        job_id: job.id,
+        job_type: job.job_type,
+        error: jobError.message,
+      });
+
+      await failAutomationJob(job, jobError);
+
+      failedCount += 1;
+
+      results.push({
+        job_id: job.id,
+        job_type: job.job_type,
+        claim_id: job.claim_id,
+        success: false,
+        error: jobError.message,
+      });
+    }
+  }
+
+  return {
+    success: true,
+    queued_submitted_claims: queuedSubmittedClaims,
+    processed_count: jobs?.length || 0,
+    completed_count: completedCount,
+    failed_count: failedCount,
+    results,
+  };
 }
 
 app.get("/health", (req, res) => {
@@ -926,9 +1574,31 @@ app.post("/mark-claim-submitted", async (req, res) => {
       throw updateError;
     }
 
+    let automationJob = null;
+
+    try {
+      automationJob = await queueAutomationJob({
+        userId: user_id,
+        claimId: claim_id,
+        jobType: "claim_check_outcome",
+      });
+    } catch (automationError) {
+      console.error(
+        "Claim submitted, but automation job could not be queued:",
+        automationError
+      );
+
+      automationJob = {
+        skipped: true,
+        reason: "automation_queue_failed",
+        error: automationError.message,
+      };
+    }
+
     res.json({
       success: true,
       claim: updatedClaim,
+      automation_job: automationJob,
     });
   } catch (error) {
     console.error("Mark claim submitted error:", error);
@@ -1026,6 +1696,19 @@ app.post("/update-claim-reference", async (req, res) => {
       });
     }
 
+    try {
+      await queueAutomationJob({
+        userId: user_id,
+        claimId: claim_id,
+        jobType: "claim_check_outcome",
+      });
+    } catch (automationError) {
+      console.error(
+        "Reference saved, but automation job could not be queued:",
+        automationError
+      );
+    }
+
     return res.json({
       success: true,
       message: "Operator claim reference saved.",
@@ -1114,10 +1797,33 @@ app.post("/update-operator-response", async (req, res) => {
       throw updateError;
     }
 
+    let automationJob = null;
+
+    try {
+      automationJob = await queueAutomationJob({
+        userId: user_id,
+        claimId: claim_id,
+        jobType: "claim_check_outcome",
+        force: true,
+      });
+    } catch (automationError) {
+      console.error(
+        "Operator response saved, but automation job could not be queued:",
+        automationError
+      );
+
+      automationJob = {
+        skipped: true,
+        reason: "automation_queue_failed",
+        error: automationError.message,
+      };
+    }
+
     res.json({
       success: true,
       message: "Operator response saved.",
       claim: updatedClaim,
+      automation_job: automationJob,
     });
   } catch (error) {
     console.error("Update operator response error:", error);
@@ -1214,6 +1920,21 @@ app.post("/update-claim-outcome", async (req, res) => {
       };
     }
 
+    if (outcome === "paid") {
+      try {
+        await queueAutomationJob({
+          userId: user_id,
+          claimId: claim_id,
+          jobType: "claim_check_payment",
+        });
+      } catch (automationError) {
+        console.error(
+          "Outcome updated, but payment automation could not be queued:",
+          automationError
+        );
+      }
+    }
+
     res.json({
       success: true,
       claim: updatedClaim,
@@ -1243,122 +1964,13 @@ app.post("/check-claim-outcome", async (req, res) => {
       });
     }
 
-    const { data: claim, error: claimError } = await withTimeout(
-      supabaseAdmin
-        .from("claims")
-        .select("*")
-        .eq("id", claim_id)
-        .eq("user_id", user_id)
-        .maybeSingle(),
-      10000,
-      "Claim lookup"
-    );
-
-    if (claimError) {
-      return res.status(500).json({
-        success: false,
-        error: "Failed to look up claim",
-        details: claimError.message,
-      });
-    }
-
-    if (!claim) {
-      return res.status(404).json({
-        success: false,
-        error: "Claim not found",
-      });
-    }
-
-    if (claim.status !== "submitted") {
-      return res.status(400).json({
-        success: false,
-        error: "Only submitted claims can be checked for an outcome.",
-        current_status: claim.status,
-      });
-    }
-
-    const detectedOutcome = detectClaimOutcomeFromText(claim);
-
-    if (detectedOutcome === "still_waiting") {
-      return res.json({
-        success: true,
-        outcome: "still_waiting",
-        updated: false,
-        message: "No final outcome detected yet. Delai will keep checking.",
-        claim,
-      });
-    }
-
-    if (claim.outcome === detectedOutcome) {
-      return res.json({
-        success: true,
-        outcome: detectedOutcome,
-        updated: false,
-        message: "Claim outcome was already up to date.",
-        claim,
-      });
-    }
-
-    const { data: updatedClaim, error: updateError } = await withTimeout(
-      supabaseAdmin
-        .from("claims")
-        .update({
-          outcome: detectedOutcome,
-          outcome_updated_at: new Date().toISOString(),
-        })
-        .eq("id", claim_id)
-        .eq("user_id", user_id)
-        .select("*")
-        .maybeSingle(),
-      10000,
-      "Claim outcome update"
-    );
-
-    if (updateError) {
-      return res.status(500).json({
-        success: false,
-        error: "Failed to update claim outcome",
-        details: updateError.message,
-      });
-    }
-
-    if (!updatedClaim) {
-      return res.status(404).json({
-        success: false,
-        error: "Claim could not be updated",
-      });
-    }
-
-    let notificationResult = null;
-
-    try {
-      notificationResult = await createNotificationForOutcomeChange({
-        userId: user_id,
-        claimId: claim_id,
-        previousOutcome: claim.outcome,
-        newOutcome: detectedOutcome,
-      });
-    } catch (notificationError) {
-      console.error(
-        "Outcome notification failed, but claim outcome was updated:",
-        notificationError
-      );
-
-      notificationResult = {
-        skipped: true,
-        reason: "notification_failed",
-        error: notificationError.message,
-      };
-    }
-
-    return res.json({
-      success: true,
-      outcome: detectedOutcome,
-      updated: true,
-      message: `Claim outcome detected: ${detectedOutcome}.`,
-      claim: updatedClaim,
-      notification: notificationResult,
+    const result = await processClaimCheckOutcomeJob({
+      user_id,
+      claim_id,
+      job_type: "claim_check_outcome",
     });
+
+    return res.json(result);
   } catch (error) {
     console.error("Check claim outcome error:", error);
 
@@ -1410,102 +2022,28 @@ async function checkSubmittedClaims({ limit }) {
 
   for (const claim of claims) {
     try {
-      const detectedOutcome = detectClaimOutcomeFromText(claim);
+      const result = await processClaimCheckOutcomeJob({
+        user_id: claim.user_id,
+        claim_id: claim.id,
+        job_type: "claim_check_outcome",
+      });
 
-      if (detectedOutcome === "still_waiting") {
-        results.push({
-          claim_id: claim.id,
-          user_id: claim.user_id,
-          previous_outcome: claim.outcome,
-          detected_outcome: "still_waiting",
-          updated: false,
-          notification_created: false,
-          message: "No final outcome detected yet.",
-        });
-
-        continue;
+      if (result.updated) {
+        updatedCount += 1;
       }
 
-      if (claim.outcome === detectedOutcome) {
-        results.push({
-          claim_id: claim.id,
-          user_id: claim.user_id,
-          previous_outcome: claim.outcome,
-          detected_outcome: detectedOutcome,
-          updated: false,
-          notification_created: false,
-          message: "Outcome already up to date.",
-        });
-
-        continue;
+      if (result.notification?.skipped === false) {
+        notificationCount += 1;
       }
-
-      const { data: updatedClaim, error: updateError } = await withTimeout(
-        supabaseAdmin
-          .from("claims")
-          .update({
-            outcome: detectedOutcome,
-            outcome_updated_at: new Date().toISOString(),
-          })
-          .eq("id", claim.id)
-          .eq("user_id", claim.user_id)
-          .select("*")
-          .single(),
-        10000,
-        `Scheduled claim outcome update ${claim.id}`
-      );
-
-      if (updateError) {
-        results.push({
-          claim_id: claim.id,
-          user_id: claim.user_id,
-          previous_outcome: claim.outcome,
-          detected_outcome: detectedOutcome,
-          updated: false,
-          notification_created: false,
-          error: updateError.message,
-        });
-
-        continue;
-      }
-
-      let notificationResult = null;
-
-      try {
-        notificationResult = await createNotificationForOutcomeChange({
-          userId: claim.user_id,
-          claimId: claim.id,
-          previousOutcome: claim.outcome,
-          newOutcome: detectedOutcome,
-        });
-
-        if (notificationResult && notificationResult.skipped === false) {
-          notificationCount += 1;
-        }
-      } catch (notificationError) {
-        console.error(
-          "Scheduled outcome notification failed, but claim outcome was updated:",
-          notificationError
-        );
-
-        notificationResult = {
-          skipped: true,
-          reason: "notification_failed",
-          error: notificationError.message,
-        };
-      }
-
-      updatedCount += 1;
 
       results.push({
         claim_id: claim.id,
         user_id: claim.user_id,
         previous_outcome: claim.outcome,
-        detected_outcome: detectedOutcome,
-        updated: true,
-        notification_created: notificationResult?.skipped === false,
-        notification: notificationResult,
-        claim: updatedClaim,
+        detected_outcome: result.outcome,
+        updated: Boolean(result.updated),
+        notification_created: result.notification?.skipped === false,
+        result,
       });
     } catch (claimError) {
       console.error("Submitted claim check failed for claim:", {
@@ -1565,13 +2103,45 @@ async function checkSubmittedClaimsHandler(req, res) {
 app.post("/check-submitted-claims", checkSubmittedClaimsHandler);
 app.get("/check-submitted-claims", checkSubmittedClaimsHandler);
 
+async function processAutomationJobsHandler(req, res) {
+  try {
+    const cronSecret = req.headers["x-cron-secret"];
+
+    if (process.env.CRON_SECRET && cronSecret !== process.env.CRON_SECRET) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized automation request",
+      });
+    }
+
+    const limit = req.body?.limit || req.query?.limit || 20;
+
+    const result = await processAutomationJobs({
+      limit,
+    });
+
+    return res.json(result);
+  } catch (error) {
+    console.error("Process automation jobs error:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to process automation jobs",
+      details: error.message,
+    });
+  }
+}
+
+app.post("/process-automation-jobs", processAutomationJobsHandler);
+app.get("/process-automation-jobs", processAutomationJobsHandler);
+
 app.post("/update-claim-payment", async (req, res) => {
   try {
     const {
       user_id,
       claim_id,
       compensation_amount,
-      fee_percentage = 15,
+      fee_percentage = 10,
       payment_status = "fee_due",
     } = req.body;
 
@@ -1682,6 +2252,7 @@ app.post("/update-claim-payment", async (req, res) => {
 
     let outcomeNotification = null;
     let paymentNotification = null;
+    let feeJob = null;
 
     try {
       outcomeNotification = await createNotificationForOutcomeChange({
@@ -1711,11 +2282,9 @@ app.post("/update-claim-payment", async (req, res) => {
         title: "Payment recorded",
         message: `A compensation payment of £${payment.compensationAmount.toFixed(
           2
-        )} has been recorded. Delai's fee is £${payment.delaiFeeAmount.toFixed(
+        )} has been recorded. Delai's success fee is £${payment.delaiFeeAmount.toFixed(
           2
-        )}, leaving £${payment.userPayoutAmount.toFixed(
-          2
-        )} for the passenger.`,
+        )}, and you keep £${payment.userPayoutAmount.toFixed(2)}.`,
       });
     } catch (notificationError) {
       console.error(
@@ -1728,6 +2297,27 @@ app.post("/update-claim-payment", async (req, res) => {
         reason: "notification_failed",
         error: notificationError.message,
       };
+    }
+
+    if (payment_status === "fee_due") {
+      try {
+        feeJob = await queueAutomationJob({
+          userId: user_id,
+          claimId: claim_id,
+          jobType: "claim_collect_fee",
+        });
+      } catch (automationError) {
+        console.error(
+          "Payment recorded, but fee collection job could not be queued:",
+          automationError
+        );
+
+        feeJob = {
+          skipped: true,
+          reason: "automation_queue_failed",
+          error: automationError.message,
+        };
+      }
     }
 
     return res.json({
@@ -1745,6 +2335,7 @@ app.post("/update-claim-payment", async (req, res) => {
         outcome: outcomeNotification,
         payment: paymentNotification,
       },
+      automation_job: feeJob,
     });
   } catch (error) {
     console.error("Update claim payment error:", error);
