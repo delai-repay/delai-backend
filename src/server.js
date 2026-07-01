@@ -262,9 +262,9 @@ function getClaimOutcomeNotification(outcome) {
   return null;
 }
 
-function calculateClaimPayment({ compensationAmount, feePercentage = 15 }) {
+function calculateClaimPayment({ compensationAmount, feePercentage = 10 }) {
   const cleanCompensationAmount = Number(compensationAmount);
-  const cleanFeePercentage = Number(feePercentage || 15);
+  const cleanFeePercentage = Number(feePercentage || 10);
 
   if (
     Number.isNaN(cleanCompensationAmount) ||
