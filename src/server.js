@@ -38,6 +38,8 @@ app.use(
 const FINAL_CLAIM_OUTCOMES = ["paid", "rejected", "needs_follow_up"];
 
 const AUTOMATION_JOB_TYPES = [
+  "claim_prepare",
+  "claim_submit",
   "claim_check_outcome",
   "claim_check_payment",
   "claim_collect_fee",
@@ -263,11 +265,13 @@ function extractCompensationAmountFromText(claim) {
   const matches = [];
 
   const poundMatches = textToCheck.matchAll(/£\s*(\d+(?:\.\d{1,2})?)/g);
+
   for (const match of poundMatches) {
     matches.push(Number(match[1]));
   }
 
   const gbpMatches = textToCheck.matchAll(/gbp\s*(\d+(?:\.\d{1,2})?)/g);
+
   for (const match of gbpMatches) {
     matches.push(Number(match[1]));
   }
@@ -453,6 +457,7 @@ async function createNotificationForOutcomeChange({
 
   if (!notificationDetails) {
     console.log("No notification needed for outcome:", newOutcome);
+
     return {
       skipped: true,
       reason: "non_final_outcome",
@@ -479,6 +484,493 @@ async function createNotificationForOutcomeChange({
     title: notificationDetails.title,
     message: notificationDetails.message,
   });
+}
+
+function formatClaimRoute(origin, destination) {
+  if (!origin || !destination) {
+    return "Not recorded";
+  }
+
+  return `${origin} to ${destination}`;
+}
+
+async function prepareClaimRecord({ userId, claimId }) {
+  const { data: claim, error: claimError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", claimId)
+      .eq("user_id", userId)
+      .maybeSingle(),
+    10000,
+    "Automatic claim preparation lookup"
+  );
+
+  if (claimError) {
+    throw claimError;
+  }
+
+  if (!claim) {
+    throw new Error("Claim not found.");
+  }
+
+  if (claim.status === "submitted") {
+    return claim;
+  }
+
+  const { data: detectedDelay, error: delayError } = await withTimeout(
+    supabaseAdmin
+      .from("detected_delays")
+      .select("*")
+      .eq("id", claim.detected_delay_id)
+      .eq("user_id", userId)
+      .maybeSingle(),
+    10000,
+    "Automatic claim delay lookup"
+  );
+
+  if (delayError) {
+    throw delayError;
+  }
+
+  if (!detectedDelay) {
+    throw new Error("Linked detected delay not found.");
+  }
+
+  const { data: seasonTickets, error: ticketError } = await withTimeout(
+    supabaseAdmin
+      .from("season_tickets")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1),
+    10000,
+    "Automatic claim ticket lookup"
+  );
+
+  if (ticketError) {
+    throw ticketError;
+  }
+
+  const { data: commutes, error: commuteError } = await withTimeout(
+    supabaseAdmin
+      .from("commutes")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1),
+    10000,
+    "Automatic claim commute lookup"
+  );
+
+  if (commuteError) {
+    throw commuteError;
+  }
+
+  const seasonTicket = seasonTickets?.[0] || null;
+  const commute = commutes?.[0] || null;
+
+  const operatorGuidance = getOperatorClaimGuidance(
+    detectedDelay.operator || commute?.operator || seasonTicket?.operator
+  );
+
+  const travelDays = Array.isArray(commute?.travel_days)
+    ? commute.travel_days.join(", ")
+    : commute?.travel_days || "Not recorded";
+
+  const preparedSummary = `
+Delay Repay Claim Summary
+
+Claim status: prepared automatically by Delai
+
+Operator-specific guidance:
+- Operator: ${operatorGuidance.operatorName}
+- Claim portal: ${operatorGuidance.claimPortal}
+- Delay threshold: ${operatorGuidance.delayThreshold}
+- Evidence needed: ${operatorGuidance.evidenceNeeded}
+
+Delay details:
+- Date: ${detectedDelay.delay_date || "Not recorded"}
+- Route: ${formatClaimRoute(
+    detectedDelay.origin_station,
+    detectedDelay.destination_station
+  )}
+- Direction: ${detectedDelay.direction || "Not recorded"}
+- Travel window: ${detectedDelay.travel_window || "Not recorded"}
+- Scheduled time: ${detectedDelay.scheduled_time || "Not recorded"}
+- Actual time: ${detectedDelay.actual_time || "Not recorded"}
+- Detected delay: ${
+    detectedDelay.delay_minutes
+      ? `${detectedDelay.delay_minutes} minutes`
+      : "Not recorded"
+  }
+- Operator: ${detectedDelay.operator || "Not recorded"}
+
+Ticket details:
+- Ticket route: ${formatClaimRoute(
+    seasonTicket?.origin_station,
+    seasonTicket?.destination_station
+  )}
+- Ticket type: ${seasonTicket?.ticket_type || "Not recorded"}
+- Ticket cost: ${seasonTicket?.ticket_cost || "Not recorded"}
+- Ticket start date: ${seasonTicket?.ticket_start_date || "Not recorded"}
+- Ticket end date: ${seasonTicket?.ticket_end_date || "Not recorded"}
+- Smartcard provider: ${seasonTicket?.smartcard_provider || "Not recorded"}
+- Smartcard number: ${seasonTicket?.smartcard_number || "Not recorded"}
+
+Commute details:
+- Saved commute route: ${formatClaimRoute(
+    commute?.origin_station,
+    commute?.destination_station
+  )}
+- Outbound window: ${commute?.outbound_time || "Not recorded"}
+- Return window: ${commute?.return_time || "Not recorded"}
+- Travel days: ${travelDays}
+
+Passenger confirmation:
+- The passenger previously confirmed this commute and ticket information.
+
+Suggested claim wording:
+${operatorGuidance.suggestedWording}
+`.trim();
+
+  const { data: updatedClaim, error: updateError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .update({
+        status: "prepared",
+        prepared_summary: preparedSummary,
+        prepared_at: new Date().toISOString(),
+        submission_status: "not_started",
+        submission_error: null,
+      })
+      .eq("id", claimId)
+      .eq("user_id", userId)
+      .select("*")
+      .single(),
+    10000,
+    "Automatic claim preparation update"
+  );
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  return updatedClaim;
+}
+
+async function submitClaimThroughOperatorAdapter({ claim, detectedDelay }) {
+  const simulationEnabled =
+    process.env.ALLOW_SIMULATED_OPERATOR_SUBMISSION === "true";
+
+  if (!simulationEnabled) {
+    return {
+      submitted: false,
+      blocked: true,
+      reason:
+        "No live train operator submission adapter is connected for this claim.",
+      source: "operator_adapter_not_connected",
+    };
+  }
+
+  const reference = `TEST-${claim.id
+    .replaceAll("-", "")
+    .slice(0, 10)
+    .toUpperCase()}`;
+
+  return {
+    submitted: true,
+    blocked: false,
+    operatorReference: reference,
+    submittedAt: new Date().toISOString(),
+    source: "simulated_operator_adapter",
+    operator: detectedDelay?.operator || "Test operator",
+  };
+}
+
+async function ensureClaimForDetectedDelay(detectedDelay) {
+  const { data: existingClaim, error: existingError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("user_id", detectedDelay.user_id)
+      .eq("detected_delay_id", detectedDelay.id)
+      .maybeSingle(),
+    10000,
+    "Detected delay claim lookup"
+  );
+
+  if (existingError) {
+    throw existingError;
+  }
+
+  let claim = existingClaim;
+
+  if (!claim) {
+    const { data: insertedClaim, error: insertError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .insert([
+          {
+            user_id: detectedDelay.user_id,
+            detected_delay_id: detectedDelay.id,
+            status: "draft",
+            submission_status: "not_started",
+          },
+        ])
+        .select("*")
+        .single(),
+      10000,
+      "Automatic claim creation"
+    );
+
+    if (insertError) {
+      throw insertError;
+    }
+
+    claim = insertedClaim;
+  }
+
+  let jobType = "claim_prepare";
+
+  if (claim.status === "prepared" || claim.status === "ready_to_submit") {
+    jobType = "claim_submit";
+  }
+
+  if (claim.status === "submitted") {
+    jobType = "claim_check_outcome";
+  }
+
+  const automationJob = await queueAutomationJob({
+    userId: claim.user_id,
+    claimId: claim.id,
+    jobType,
+  });
+
+  return {
+    claim,
+    automationJob,
+  };
+}
+
+async function processClaimPrepareJob(job) {
+  const { data: currentClaim, error: currentClaimError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", job.claim_id)
+      .eq("user_id", job.user_id)
+      .maybeSingle(),
+    10000,
+    "Claim preparation job lookup"
+  );
+
+  if (currentClaimError) {
+    throw currentClaimError;
+  }
+
+  if (!currentClaim) {
+    return {
+      success: true,
+      message: "Claim no longer exists.",
+    };
+  }
+
+  if (currentClaim.status === "submitted") {
+    const outcomeJob = await queueAutomationJob({
+      userId: currentClaim.user_id,
+      claimId: currentClaim.id,
+      jobType: "claim_check_outcome",
+    });
+
+    return {
+      success: true,
+      message: "Claim was already submitted. Outcome monitoring queued.",
+      next_job: outcomeJob,
+    };
+  }
+
+  let preparedClaim = currentClaim;
+
+  if (
+    currentClaim.status !== "prepared" &&
+    currentClaim.status !== "ready_to_submit"
+  ) {
+    preparedClaim = await prepareClaimRecord({
+      userId: currentClaim.user_id,
+      claimId: currentClaim.id,
+    });
+  }
+
+  const submitJob = await queueAutomationJob({
+    userId: preparedClaim.user_id,
+    claimId: preparedClaim.id,
+    jobType: "claim_submit",
+  });
+
+  return {
+    success: true,
+    message: "Claim prepared automatically. Submission job queued.",
+    claim: preparedClaim,
+    next_job: submitJob,
+  };
+}
+
+async function processClaimSubmitJob(job) {
+  const { data: claim, error: claimError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("id", job.claim_id)
+      .eq("user_id", job.user_id)
+      .maybeSingle(),
+    10000,
+    "Claim submission job lookup"
+  );
+
+  if (claimError) {
+    throw claimError;
+  }
+
+  if (!claim) {
+    return {
+      success: true,
+      message: "Claim no longer exists.",
+    };
+  }
+
+  if (claim.status === "submitted") {
+    const outcomeJob = await queueAutomationJob({
+      userId: claim.user_id,
+      claimId: claim.id,
+      jobType: "claim_check_outcome",
+    });
+
+    return {
+      success: true,
+      message: "Claim was already submitted. Outcome monitoring queued.",
+      next_job: outcomeJob,
+    };
+  }
+
+  if (claim.status !== "prepared" && claim.status !== "ready_to_submit") {
+    throw new Error(
+      `Claim is not ready for submission. Current status: ${claim.status}.`
+    );
+  }
+
+  const { data: detectedDelay, error: delayError } = await withTimeout(
+    supabaseAdmin
+      .from("detected_delays")
+      .select("*")
+      .eq("id", claim.detected_delay_id)
+      .eq("user_id", claim.user_id)
+      .maybeSingle(),
+    10000,
+    "Submission delay lookup"
+  );
+
+  if (delayError) {
+    throw delayError;
+  }
+
+  if (!detectedDelay) {
+    throw new Error("Linked detected delay not found for submission.");
+  }
+
+  const attemptedAt = new Date().toISOString();
+
+  const { error: processingUpdateError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .update({
+        status: "ready_to_submit",
+        submission_status: "processing",
+        submission_attempted_at: attemptedAt,
+        submission_error: null,
+      })
+      .eq("id", claim.id)
+      .eq("user_id", claim.user_id),
+    10000,
+    "Mark submission processing"
+  );
+
+  if (processingUpdateError) {
+    throw processingUpdateError;
+  }
+
+  const submissionResult = await submitClaimThroughOperatorAdapter({
+    claim,
+    detectedDelay,
+  });
+
+  if (!submissionResult.submitted) {
+    const { error: blockUpdateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "ready_to_submit",
+          submission_status: "awaiting_operator_integration",
+          submission_attempted_at: attemptedAt,
+          submission_error: submissionResult.reason,
+          submission_source: submissionResult.source,
+        })
+        .eq("id", claim.id)
+        .eq("user_id", claim.user_id),
+      10000,
+      "Block claim submission"
+    );
+
+    if (blockUpdateError) {
+      throw blockUpdateError;
+    }
+
+    return {
+      success: true,
+      blocked: true,
+      message: submissionResult.reason,
+      submission: submissionResult,
+    };
+  }
+
+  const { data: submittedClaim, error: submissionUpdateError } =
+    await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "submitted",
+          submitted_at: submissionResult.submittedAt,
+          operator_reference: submissionResult.operatorReference,
+          submission_status: "submitted",
+          submission_attempted_at: attemptedAt,
+          submission_error: null,
+          submission_source: submissionResult.source,
+        })
+        .eq("id", claim.id)
+        .eq("user_id", claim.user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Complete automatic claim submission"
+    );
+
+  if (submissionUpdateError) {
+    throw submissionUpdateError;
+  }
+
+  const outcomeJob = await queueAutomationJob({
+    userId: submittedClaim.user_id,
+    claimId: submittedClaim.id,
+    jobType: "claim_check_outcome",
+  });
+
+  return {
+    success: true,
+    message: "Claim submitted automatically.",
+    claim: submittedClaim,
+    submission: submissionResult,
+    next_job: outcomeJob,
+  };
 }
 
 async function queueAutomationJob({
@@ -564,6 +1056,24 @@ async function completeAutomationJob(jobId) {
       .eq("id", jobId),
     10000,
     "Complete automation job"
+  );
+
+  if (error) {
+    throw error;
+  }
+}
+
+async function blockAutomationJob(jobId, reason) {
+  const { error } = await withTimeout(
+    supabaseAdmin
+      .from("automation_jobs")
+      .update({
+        status: "blocked",
+        last_error: reason || "Automation job is blocked.",
+      })
+      .eq("id", jobId),
+    10000,
+    "Block automation job"
   );
 
   if (error) {
@@ -957,6 +1467,14 @@ async function processClaimCollectFeeJob(job) {
 }
 
 async function processAutomationJob(job) {
+  if (job.job_type === "claim_prepare") {
+    return processClaimPrepareJob(job);
+  }
+
+  if (job.job_type === "claim_submit") {
+    return processClaimSubmitJob(job);
+  }
+
   if (job.job_type === "claim_check_outcome") {
     return processClaimCheckOutcomeJob(job);
   }
@@ -1000,6 +1518,7 @@ async function processAutomationJobs({ limit = 20 }) {
 
   const results = [];
   let completedCount = 0;
+  let blockedCount = 0;
   let failedCount = 0;
 
   for (const job of jobs || []) {
@@ -1027,9 +1546,17 @@ async function processAutomationJobs({ limit = 20 }) {
 
       const result = await processAutomationJob(processingJob);
 
-      await completeAutomationJob(processingJob.id);
+      if (result?.blocked) {
+        await blockAutomationJob(
+          processingJob.id,
+          result.message || "Operator integration is not connected."
+        );
 
-      completedCount += 1;
+        blockedCount += 1;
+      } else {
+        await completeAutomationJob(processingJob.id);
+        completedCount += 1;
+      }
 
       results.push({
         job_id: processingJob.id,
@@ -1064,6 +1591,7 @@ async function processAutomationJobs({ limit = 20 }) {
     queued_submitted_claims: queuedSubmittedClaims,
     processed_count: jobs?.length || 0,
     completed_count: completedCount,
+    blocked_count: blockedCount,
     failed_count: failedCount,
     results,
   };
@@ -1176,13 +1704,15 @@ app.post("/detect-delays", async (req, res) => {
     const createdDelays = [];
 
     for (const commute of commutes) {
-      const travelDays = Array.isArray(commute.travel_days)
-        ? commute.travel_days
-        : [];
+    const travelDays = Array.isArray(commute.travel_days)
+    ? commute.travel_days
+    : [];
 
-      if (!travelDays.includes(todayDay)) {
-        continue;
-      }
+    const forceDetection = req.body?.force === true;
+
+     if (!forceDetection && !travelDays.includes(todayDay)) {
+    continue;
+    }
 
       const testDelay = {
         user_id: commute.user_id,
@@ -1234,6 +1764,24 @@ app.post("/detect-delays", async (req, res) => {
 
       if (insertError) {
         throw insertError;
+      }
+
+      try {
+        const claimAutomation = await ensureClaimForDetectedDelay(insertedDelay);
+
+        console.log("Automatic claim pipeline started:", {
+          delay_id: insertedDelay.id,
+          claim_id: claimAutomation.claim?.id,
+          job_type: claimAutomation.automationJob?.job?.job_type,
+        });
+      } catch (automationError) {
+        console.error(
+          "Delay created, but automatic claim pipeline could not start:",
+          {
+            delay_id: insertedDelay.id,
+            error: automationError.message,
+          }
+        );
       }
 
       createdDelays.push(insertedDelay);
