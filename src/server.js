@@ -4,6 +4,7 @@ import helmet from "helmet";
 import dotenv from "dotenv";
 import { query } from "./db.js";
 import { supabaseAdmin } from "./lib/supabaseAdmin.js";
+import { getOperatorAdapter } from "./operators/operatorRegistry.js";
 
 dotenv.config();
 
@@ -659,33 +660,20 @@ ${operatorGuidance.suggestedWording}
   return updatedClaim;
 }
 
-async function submitClaimThroughOperatorAdapter({ claim, detectedDelay }) {
-  const simulationEnabled =
-    process.env.ALLOW_SIMULATED_OPERATOR_SUBMISSION === "true";
+async function submitClaimThroughOperatorAdapter({
+  claim,
+  detectedDelay,
+}) {
+  const operatorAdapter = getOperatorAdapter({
+    operator: detectedDelay?.operator,
+    allowSimulation:
+      process.env.ALLOW_SIMULATED_OPERATOR_SUBMISSION === "true",
+  });
 
-  if (!simulationEnabled) {
-    return {
-      submitted: false,
-      blocked: true,
-      reason:
-        "No live train operator submission adapter is connected for this claim.",
-      source: "operator_adapter_not_connected",
-    };
-  }
-
-  const reference = `TEST-${claim.id
-    .replaceAll("-", "")
-    .slice(0, 10)
-    .toUpperCase()}`;
-
-  return {
-    submitted: true,
-    blocked: false,
-    operatorReference: reference,
-    submittedAt: new Date().toISOString(),
-    source: "simulated_operator_adapter",
-    operator: detectedDelay?.operator || "Test operator",
-  };
+  return operatorAdapter.submitClaim({
+    claim,
+    detectedDelay,
+  });
 }
 
 async function ensureClaimForDetectedDelay(detectedDelay) {
