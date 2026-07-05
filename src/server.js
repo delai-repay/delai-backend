@@ -10,6 +10,7 @@ import {
 } from "./operators/operatorRegistry.js";
 
 import { getAllOperators } from "./operators/operatorCatalog.js";
+import { buildClaimSubmissionContext } from "./operators/claimSubmissionContext.js";
 
 dotenv.config();
 
@@ -664,13 +665,143 @@ ${operatorGuidance.suggestedWording}
 
   return updatedClaim;
 }
-
-async function submitClaimThroughOperatorAdapter({
+async function loadClaimSubmissionContext({
   claim,
   detectedDelay,
 }) {
+  if (!claim?.user_id) {
+    throw new Error(
+      "Claim user ID is required to load submission context."
+    );
+  }
+
+  if (!detectedDelay?.id) {
+    throw new Error(
+      "Detected delay is required to load submission context."
+    );
+  }
+
+  let profile = null;
+
+  const {
+    data: profileById,
+    error: profileByIdError,
+  } = await withTimeout(
+    supabaseAdmin
+      .from("profiles")
+      .select("*")
+      .eq("id", claim.user_id)
+      .maybeSingle(),
+    10000,
+    "Submission profile lookup by ID"
+  );
+
+  if (!profileByIdError) {
+    profile = profileById;
+  } else {
+    const {
+      data: profileByUserId,
+      error: profileByUserIdError,
+    } = await withTimeout(
+      supabaseAdmin
+        .from("profiles")
+        .select("*")
+        .eq("user_id", claim.user_id)
+        .maybeSingle(),
+      10000,
+      "Submission profile lookup by user ID"
+    );
+
+    if (profileByUserIdError) {
+      throw profileByUserIdError;
+    }
+
+    profile = profileByUserId;
+  }
+
+  const {
+    data: seasonTickets,
+    error: seasonTicketError,
+  } = await withTimeout(
+    supabaseAdmin
+      .from("season_tickets")
+      .select("*")
+      .eq("user_id", claim.user_id)
+      .order("created_at", { ascending: false })
+      .limit(1),
+    10000,
+    "Submission season ticket lookup"
+  );
+
+  if (seasonTicketError) {
+    throw seasonTicketError;
+  }
+
+  const seasonTicket = seasonTickets?.[0] || null;
+
+  let commute = null;
+
+  if (detectedDelay.commute_id) {
+    const {
+      data: linkedCommute,
+      error: linkedCommuteError,
+    } = await withTimeout(
+      supabaseAdmin
+        .from("commutes")
+        .select("*")
+        .eq("id", detectedDelay.commute_id)
+        .eq("user_id", claim.user_id)
+        .maybeSingle(),
+      10000,
+      "Submission linked commute lookup"
+    );
+
+    if (linkedCommuteError) {
+      throw linkedCommuteError;
+    }
+
+    commute = linkedCommute;
+  }
+
+  if (!commute) {
+    const {
+      data: recentCommutes,
+      error: recentCommuteError,
+    } = await withTimeout(
+      supabaseAdmin
+        .from("commutes")
+        .select("*")
+        .eq("user_id", claim.user_id)
+        .order("created_at", { ascending: false })
+        .limit(1),
+      10000,
+      "Submission recent commute lookup"
+    );
+
+    if (recentCommuteError) {
+      throw recentCommuteError;
+    }
+
+    commute = recentCommutes?.[0] || null;
+  }
+
+  return buildClaimSubmissionContext({
+    claim,
+    detectedDelay,
+    profile,
+    seasonTicket,
+    commute,
+  });
+}
+async function submitClaimThroughOperatorAdapter({
+  claim,
+  detectedDelay,
+  submissionContext,
+}) {
   const operatorAdapter = getOperatorAdapter({
-    operator: detectedDelay?.operator,
+    operator:
+      submissionContext?.operator?.suppliedName ||
+      detectedDelay?.operator,
     allowSimulation:
       process.env.ALLOW_SIMULATED_OPERATOR_SUBMISSION === "true",
   });
@@ -678,6 +809,7 @@ async function submitClaimThroughOperatorAdapter({
   return operatorAdapter.submitClaim({
     claim,
     detectedDelay,
+    submissionContext,
   });
 }
 
@@ -870,6 +1002,11 @@ async function processClaimSubmitJob(job) {
   if (!detectedDelay) {
     throw new Error("Linked detected delay not found for submission.");
   }
+  const submissionContext =
+  await loadClaimSubmissionContext({
+    claim,
+    detectedDelay,
+  });
 
   const attemptedAt = new Date().toISOString();
 
@@ -895,7 +1032,8 @@ async function processClaimSubmitJob(job) {
   const submissionResult = await submitClaimThroughOperatorAdapter({
     claim,
     detectedDelay,
-  });
+    submissionContext,
+   });
 
   if (!submissionResult.submitted) {
     const { error: blockUpdateError } = await withTimeout(
