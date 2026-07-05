@@ -1,68 +1,111 @@
 import BaseOperatorAdapter from "./baseOperatorAdapter.js";
 import SimulatedOperatorAdapter from "./simulatedOperatorAdapter.js";
+import {
+  getOperatorByKey,
+  normaliseOperatorName,
+  resolveOperator,
+} from "./operatorCatalog.js";
 
 const registeredOperatorAdapters = new Map();
 
-function normaliseOperatorName(operatorName) {
-  return String(operatorName || "")
-    .trim()
-    .toLowerCase()
-    .replace(/&/g, "and")
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-}
+function resolveOperatorIdentity(operatorName) {
+  const suppliedName = String(operatorName || "").trim();
+  const catalogOperator = resolveOperator(suppliedName);
 
-function registerOperatorAdapter({ names, createAdapter }) {
-  if (!Array.isArray(names) || names.length === 0) {
-    throw new Error(
-      "registerOperatorAdapter requires at least one operator name."
-    );
+  if (catalogOperator) {
+    return {
+      operatorKey: catalogOperator.key,
+      displayName: catalogOperator.displayName,
+      knownOperator: true,
+    };
   }
 
+  return {
+    operatorKey:
+      normaliseOperatorName(suppliedName) || "unknown_operator",
+    displayName: suppliedName || "Unknown train operator",
+    knownOperator: false,
+  };
+}
+
+function registerOperatorAdapter({
+  operatorKey,
+  names = [],
+  createAdapter,
+}) {
   if (typeof createAdapter !== "function") {
     throw new Error(
       "registerOperatorAdapter requires a createAdapter function."
     );
   }
 
-  for (const name of names) {
-    const operatorKey = normaliseOperatorName(name);
+  const catalogOperator = operatorKey
+    ? getOperatorByKey(operatorKey)
+    : names
+        .map((name) => resolveOperator(name))
+        .find(Boolean);
 
-    if (!operatorKey) {
-      continue;
-    }
+  const registryKey =
+    catalogOperator?.key ||
+    normaliseOperatorName(operatorKey || names[0]);
 
-    registeredOperatorAdapters.set(operatorKey, createAdapter);
+  if (!registryKey) {
+    throw new Error(
+      "registerOperatorAdapter requires a valid operator key or name."
+    );
   }
+
+  registeredOperatorAdapters.set(registryKey, createAdapter);
+
+  return registryKey;
 }
 
-function getOperatorAdapter({ operator, allowSimulation = false } = {}) {
-  const displayName =
-    String(operator || "").trim() || "Unknown train operator";
-
-  const operatorKey =
-    normaliseOperatorName(displayName) || "unknown_operator";
+function getOperatorAdapter({
+  operator,
+  allowSimulation = false,
+} = {}) {
+  const identity = resolveOperatorIdentity(operator);
 
   if (allowSimulation) {
     return new SimulatedOperatorAdapter({
-      operatorKey,
-      displayName,
+      operatorKey: identity.operatorKey,
+      displayName: identity.displayName,
     });
   }
 
-  const createAdapter = registeredOperatorAdapters.get(operatorKey);
+  const createAdapter = registeredOperatorAdapters.get(
+    identity.operatorKey
+  );
 
   if (createAdapter) {
     return createAdapter({
-      operatorKey,
-      displayName,
+      operatorKey: identity.operatorKey,
+      displayName: identity.displayName,
     });
   }
 
   return new BaseOperatorAdapter({
-    operatorKey,
-    displayName,
+    operatorKey: identity.operatorKey,
+    displayName: identity.displayName,
   });
+}
+
+function getOperatorIntegrationStatus(operatorName) {
+  const identity = resolveOperatorIdentity(operatorName);
+
+  const adapterRegistered = registeredOperatorAdapters.has(
+    identity.operatorKey
+  );
+
+  return {
+    operatorKey: identity.operatorKey,
+    displayName: identity.displayName,
+    knownOperator: identity.knownOperator,
+    adapterRegistered,
+    integrationStatus: adapterRegistered
+      ? "connected"
+      : "awaiting_integration",
+  };
 }
 
 function getRegisteredOperatorKeys() {
@@ -71,7 +114,8 @@ function getRegisteredOperatorKeys() {
 
 export {
   getOperatorAdapter,
+  getOperatorIntegrationStatus,
   getRegisteredOperatorKeys,
-  normaliseOperatorName,
   registerOperatorAdapter,
+  resolveOperatorIdentity,
 };

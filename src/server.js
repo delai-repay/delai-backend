@@ -4,7 +4,12 @@ import helmet from "helmet";
 import dotenv from "dotenv";
 import { query } from "./db.js";
 import { supabaseAdmin } from "./lib/supabaseAdmin.js";
-import { getOperatorAdapter } from "./operators/operatorRegistry.js";
+import {
+  getOperatorAdapter,
+  getOperatorIntegrationStatus,
+} from "./operators/operatorRegistry.js";
+
+import { getAllOperators } from "./operators/operatorCatalog.js";
 
 dotenv.config();
 
@@ -1589,6 +1594,29 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "delai-backend",
+  });
+});
+app.get("/operators", (req, res) => {
+  const operators = getAllOperators().map((operator) => {
+    const integration = getOperatorIntegrationStatus(
+      operator.key
+    );
+
+    return {
+      key: operator.key,
+      display_name: operator.displayName,
+      aliases: operator.aliases,
+      submission_adapter_connected:
+        integration.adapterRegistered,
+      integration_status:
+        integration.integrationStatus,
+    };
+  });
+
+  return res.json({
+    ok: true,
+    operator_count: operators.length,
+    operators,
   });
 });
 
