@@ -39,6 +39,7 @@ function buildClaimSubmissionContext({
   claim,
   detectedDelay,
   profile = null,
+  authUser = null,
   seasonTicket = null,
   commute = null,
 }) {
@@ -87,25 +88,25 @@ function buildClaimSubmissionContext({
     },
 
     passenger: {
-      userId: claim.user_id,
-      fullName:
-        cleanText(profile?.full_name) ||
-        cleanText(profile?.name) ||
-        cleanText(profile?.display_name),
-      firstName: cleanText(profile?.first_name),
-      lastName: cleanText(profile?.last_name),
-      email: cleanText(profile?.email),
-      mobile:
-        cleanText(profile?.mobile) ||
-        cleanText(profile?.phone) ||
-        cleanText(profile?.phone_number),
-      addressLine1: cleanText(profile?.address_line_1),
-      addressLine2: cleanText(profile?.address_line_2),
-      townOrCity:
-        cleanText(profile?.town_or_city) ||
-        cleanText(profile?.city),
-      postcode: cleanText(profile?.postcode),
-    },
+    fullName:
+    cleanText(profile?.full_name) ||
+    cleanText(profile?.name) ||
+    cleanText(
+      authUser?.user_metadata?.full_name
+    ) ||
+    cleanText(authUser?.user_metadata?.name),
+
+    email:
+    cleanText(profile?.email) ||
+    cleanText(authUser?.email) ||
+    cleanText(authUser?.user_metadata?.email),
+
+    mobile:
+    cleanText(profile?.mobile) ||
+    cleanText(profile?.phone) ||
+    cleanText(authUser?.phone) ||
+    cleanText(authUser?.user_metadata?.phone),
+  },
 
     journey: {
       delayId: detectedDelay.id,
@@ -130,27 +131,47 @@ function buildClaimSubmissionContext({
     },
 
     ticket: {
-      id: seasonTicket?.id || null,
-      type: cleanText(seasonTicket?.ticket_type),
-      cost: cleanNumber(seasonTicket?.ticket_cost),
-      originStation: cleanText(
-        seasonTicket?.origin_station
-      ),
-      destinationStation: cleanText(
-        seasonTicket?.destination_station
-      ),
-      startDate: seasonTicket?.ticket_start_date || null,
-      endDate: seasonTicket?.ticket_end_date || null,
-      bookingReference:
-        cleanText(seasonTicket?.booking_reference) ||
-        cleanText(seasonTicket?.booking_ref),
-      smartcardProvider: cleanText(
-        seasonTicket?.smartcard_provider
-      ),
-      smartcardNumber: cleanText(
-        seasonTicket?.smartcard_number
-      ),
-    },
+  id: seasonTicket?.id || null,
+
+  type: cleanText(seasonTicket?.ticket_type),
+
+  cost: cleanNumber(
+    seasonTicket?.ticket_cost ??
+      seasonTicket?.cost ??
+      seasonTicket?.purchase_price
+  ),
+
+  originStation: cleanText(
+    seasonTicket?.origin_station
+  ),
+
+  destinationStation: cleanText(
+    seasonTicket?.destination_station
+  ),
+
+  startDate:
+    seasonTicket?.ticket_start_date ||
+    seasonTicket?.valid_from ||
+    null,
+
+  endDate:
+    seasonTicket?.ticket_end_date ||
+    seasonTicket?.valid_until ||
+    null,
+
+  bookingReference:
+    cleanText(seasonTicket?.booking_reference) ||
+    cleanText(seasonTicket?.booking_ref) ||
+    cleanText(seasonTicket?.ticket_reference),
+
+  smartcardProvider:
+    cleanText(seasonTicket?.smartcard_provider) ||
+    cleanText(seasonTicket?.operator),
+
+  smartcardNumber: cleanText(
+    seasonTicket?.smartcard_number
+  ),
+},
 
     commute: {
       id: commute?.id || null,

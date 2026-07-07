@@ -11,6 +11,7 @@ import {
 
 import { getAllOperators } from "./operators/operatorCatalog.js";
 import { buildClaimSubmissionContext } from "./operators/claimSubmissionContext.js";
+import { validateSubmissionContext } from "./operators/submissionValidation.js";
 
 dotenv.config();
 
@@ -784,14 +785,29 @@ async function loadClaimSubmissionContext({
 
     commute = recentCommutes?.[0] || null;
   }
+  const { data: authUserData, error: authUserError } =
+  await withTimeout(
+    supabaseAdmin.auth.admin.getUserById(
+      claim.user_id
+    ),
+    10000,
+    "Submission context auth user lookup"
+  );
+
+    if (authUserError) {
+   throw authUserError;
+  }
+
+  const authUser = authUserData?.user || null;
 
   return buildClaimSubmissionContext({
-    claim,
-    detectedDelay,
-    profile,
-    seasonTicket,
-    commute,
-  });
+  claim,
+  detectedDelay,
+  profile,
+  authUser,
+  seasonTicket,
+  commute,
+});
 }
 async function submitClaimThroughOperatorAdapter({
   claim,
@@ -1008,7 +1024,59 @@ async function processClaimSubmitJob(job) {
     detectedDelay,
   });
 
-  const attemptedAt = new Date().toISOString();
+const submissionValidation =
+  validateSubmissionContext(submissionContext);
+
+const attemptedAt = new Date().toISOString();
+
+if (!submissionValidation.readyForSubmission) {
+  const missingFields =
+    submissionValidation.missingFields.length > 0
+      ? submissionValidation.missingFields.join(", ")
+      : "unknown fields";
+
+  const validationMessage =
+    `Claim submission is blocked because required information is missing or invalid: ${missingFields}.`;
+
+  const { error: validationUpdateError } =
+    await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "ready_to_submit",
+          submission_status: "awaiting_information",
+          submission_attempted_at: attemptedAt,
+          submission_error: validationMessage,
+          submission_source:
+            "universal_submission_validation",
+        })
+        .eq("id", claim.id)
+        .eq("user_id", claim.user_id),
+      10000,
+      "Block invalid claim submission"
+    );
+
+  if (validationUpdateError) {
+    throw validationUpdateError;
+  }
+
+  return {
+    success: true,
+    blocked: true,
+    message: validationMessage,
+    validation: {
+      valid: submissionValidation.valid,
+      blockingIssueCount:
+        submissionValidation.blockingIssueCount,
+      warningCount:
+        submissionValidation.warningCount,
+      errors: submissionValidation.errors,
+      warnings: submissionValidation.warnings,
+      missingFields:
+        submissionValidation.missingFields,
+    },
+  };
+}
 
   const { error: processingUpdateError } = await withTimeout(
     supabaseAdmin
@@ -2143,6 +2211,120 @@ Suggested next action:
     res.status(500).json({
       success: false,
       error: "Failed to prepare claim",
+      details: error.message,
+    });
+  }
+});
+app.post("/validate-claim-submission", async (req, res) => {
+  try {
+    const { user_id, claim_id } = req.body;
+
+    if (!user_id || !claim_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing user_id or claim_id",
+      });
+    }
+
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .maybeSingle(),
+      10000,
+      "Submission validation claim lookup"
+    );
+
+    if (claimError) {
+      throw claimError;
+    }
+
+    if (!claim) {
+      return res.status(404).json({
+        success: false,
+        error: "Claim not found",
+      });
+    }
+
+    if (!claim.detected_delay_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Claim has no linked detected delay",
+      });
+    }
+
+    const { data: detectedDelay, error: delayError } =
+      await withTimeout(
+        supabaseAdmin
+          .from("detected_delays")
+          .select("*")
+          .eq("id", claim.detected_delay_id)
+          .eq("user_id", user_id)
+          .maybeSingle(),
+        10000,
+        "Submission validation delay lookup"
+      );
+
+    if (delayError) {
+      throw delayError;
+    }
+
+    if (!detectedDelay) {
+      return res.status(404).json({
+        success: false,
+        error: "Linked detected delay not found",
+      });
+    }
+
+    const submissionContext =
+      await loadClaimSubmissionContext({
+        claim,
+        detectedDelay,
+      });
+
+    const validation =
+      validateSubmissionContext(submissionContext);
+
+    return res.json({
+      success: true,
+      ready_for_submission:
+        validation.readyForSubmission,
+      claim: {
+        id: claim.id,
+        status: claim.status,
+        submission_status:
+          claim.submission_status || null,
+      },
+      operator: {
+        key: submissionContext.operator?.key || null,
+        display_name:
+          submissionContext.operator?.displayName || null,
+        known_operator:
+          submissionContext.operator?.knownOperator === true,
+      },
+      validation: {
+        valid: validation.valid,
+        blocking_issue_count:
+          validation.blockingIssueCount,
+        warning_count: validation.warningCount,
+        missing_fields: validation.missingFields,
+        errors: validation.errors,
+        warnings: validation.warnings,
+        checked_at: validation.checkedAt,
+        context_version: validation.contextVersion,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "Validate claim submission error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to validate claim submission",
       details: error.message,
     });
   }
