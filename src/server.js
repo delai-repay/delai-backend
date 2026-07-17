@@ -313,23 +313,36 @@ function normaliseSubmissionIssueText(issue) {
     return issue;
   }
 
-  return (
-    issue.label ||
-    issue.message ||
-    issue.field ||
-    issue.key ||
-    issue.name ||
-    JSON.stringify(issue)
-  );
+  const parts = [
+    issue.label,
+    issue.message,
+    issue.field,
+    issue.key,
+    issue.name,
+    issue.path,
+    issue.code,
+  ].filter(Boolean);
+
+  if (parts.length > 0) {
+    return parts.join(" ");
+  }
+
+  try {
+    return JSON.stringify(issue);
+  } catch {
+    return String(issue);
+  }
 }
 
-function getCustomerMissingDetailLabel(issue) {
-  const rawText = normaliseSubmissionIssueText(issue);
-  const readableText = rawText
+function cleanIssueText(issue) {
+  return normaliseSubmissionIssueText(issue)
     .replace(/[._-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
 
+function getCustomerMissingDetailLabel(issue) {
+  const readableText = cleanIssueText(issue);
   const lowerText = readableText.toLowerCase();
 
   if (!lowerText) {
@@ -344,27 +357,41 @@ function getCustomerMissingDetailLabel(issue) {
   }
 
   if (
-    lowerText.includes("booking") ||
-    lowerText.includes("reference")
+    lowerText.includes("booking reference") ||
+    lowerText.includes("ticket reference") ||
+    lowerText.includes("reference number")
   ) {
     return "Booking reference is missing.";
   }
 
   if (
-    lowerText.includes("ticket") &&
-    (lowerText.includes("cost") ||
-      lowerText.includes("price") ||
-      lowerText.includes("fare") ||
-      lowerText.includes("amount"))
+    lowerText.includes("ticket cost") ||
+    lowerText.includes("ticket price") ||
+    lowerText.includes("ticket fare") ||
+    lowerText.includes("fare paid") ||
+    lowerText.includes("cost paid") ||
+    lowerText.includes("ticket amount")
   ) {
     return "Ticket cost is missing.";
   }
 
   if (
-    lowerText.includes("ticket") &&
-    lowerText.includes("type")
+    lowerText.includes("ticket type") ||
+    lowerText.includes("season ticket type")
   ) {
     return "Ticket type is missing.";
+  }
+
+  if (
+    lowerText.includes("valid from") ||
+    lowerText.includes("valid until") ||
+    lowerText.includes("valid to") ||
+    lowerText.includes("ticket start") ||
+    lowerText.includes("ticket end") ||
+    lowerText.includes("ticket date") ||
+    lowerText.includes("season ticket date")
+  ) {
+    return "Ticket dates are missing.";
   }
 
   if (
@@ -375,15 +402,6 @@ function getCustomerMissingDetailLabel(issue) {
       lowerText.includes("station"))
   ) {
     return "Ticket route is incomplete.";
-  }
-
-  if (
-    lowerText.includes("ticket") &&
-    (lowerText.includes("start") ||
-      lowerText.includes("end") ||
-      lowerText.includes("date"))
-  ) {
-    return "Ticket dates are missing.";
   }
 
   if (
@@ -410,28 +428,32 @@ function getCustomerMissingDetailLabel(issue) {
     lowerText.includes("return") ||
     lowerText.includes("travel window") ||
     lowerText.includes("window") ||
-    lowerText.includes("time")
+    lowerText.includes("scheduled time") ||
+    lowerText.includes("journey time")
   ) {
     return "Travel window is missing.";
   }
 
   if (
     lowerText.includes("travel days") ||
-    lowerText.includes("travel day")
+    lowerText.includes("travel day") ||
+    lowerText.includes("commute days")
   ) {
     return "Travel days are missing.";
   }
 
   if (
     lowerText.includes("operator") ||
-    lowerText.includes("train company")
+    lowerText.includes("train company") ||
+    lowerText.includes("toc")
   ) {
     return "Train operator is missing.";
   }
 
   if (
     lowerText.includes("delay date") ||
-    lowerText.includes("journey date")
+    lowerText.includes("journey date") ||
+    lowerText.includes("travel date")
   ) {
     return "Delay date is missing.";
   }
@@ -439,7 +461,7 @@ function getCustomerMissingDetailLabel(issue) {
   if (
     lowerText.includes("delay minutes") ||
     lowerText.includes("delay length") ||
-    lowerText.includes("minutes")
+    lowerText.includes("delay duration")
   ) {
     return "Delay length is missing.";
   }
@@ -448,13 +470,42 @@ function getCustomerMissingDetailLabel(issue) {
     lowerText.includes("profile") ||
     lowerText.includes("passenger") ||
     lowerText.includes("full name") ||
-    lowerText.includes("name") ||
-    lowerText.includes("email")
+    lowerText.includes("first name") ||
+    lowerText.includes("last name") ||
+    lowerText.includes("email") ||
+    lowerText.includes("phone") ||
+    lowerText.includes("mobile")
   ) {
     return "Passenger contact details are missing.";
   }
 
-  return `${readableText.charAt(0).toUpperCase()}${readableText.slice(1)} is missing.`;
+  const fallbackText = readableText || "Required claim detail";
+  return `${fallbackText.charAt(0).toUpperCase()}${fallbackText.slice(1)} is missing.`;
+}
+
+function getMissingDetailDestinationFromLabel(label) {
+  const lowerLabel = (label || "").toLowerCase();
+
+  if (
+    lowerLabel.includes("ticket") ||
+    lowerLabel.includes("smartcard") ||
+    lowerLabel.includes("booking reference")
+  ) {
+    return "ticket";
+  }
+
+  if (
+    lowerLabel.includes("commute") ||
+    lowerLabel.includes("journey") ||
+    lowerLabel.includes("travel window") ||
+    lowerLabel.includes("travel days") ||
+    lowerLabel.includes("train operator") ||
+    lowerLabel.includes("delay")
+  ) {
+    return "commute";
+  }
+
+  return "claim";
 }
 
 function buildCustomerBlockingIssues(validation) {
@@ -482,6 +533,8 @@ function buildCustomerBlockingIssues(validation) {
 
       return {
         label,
+        message: label,
+        section: getMissingDetailDestinationFromLabel(label),
         raw: rawText,
       };
     })
@@ -490,18 +543,28 @@ function buildCustomerBlockingIssues(validation) {
 
 function buildValidationResponse(validation) {
   const blockingIssues = buildCustomerBlockingIssues(validation);
+  const blockingLabels = blockingIssues.map((issue) => issue.label);
 
   return {
     valid: validation.valid,
     ready_for_submission: validation.readyForSubmission,
+    readyForSubmission: validation.readyForSubmission,
     blocking_issue_count: validation.blockingIssueCount,
+    blockingIssueCount: validation.blockingIssueCount,
     warning_count: validation.warningCount,
+    warningCount: validation.warningCount,
     missing_fields: validation.missingFields,
+    missingFields: validation.missingFields,
     errors: validation.errors,
     warnings: validation.warnings,
     blocking_issues: blockingIssues,
+    blockingIssues,
+    missing_detail_labels: blockingLabels,
+    customer_missing_details: blockingLabels,
     checked_at: validation.checkedAt,
+    checkedAt: validation.checkedAt,
     context_version: validation.contextVersion,
+    contextVersion: validation.contextVersion,
   };
 }
 
@@ -1232,13 +1295,9 @@ const submissionValidation =
 const attemptedAt = new Date().toISOString();
 
 if (!submissionValidation.readyForSubmission) {
-  const missingFields =
-    submissionValidation.missingFields.length > 0
-      ? submissionValidation.missingFields.join(", ")
-      : "unknown fields";
-
-  const validationMessage =
-    `Claim submission is blocked because required information is missing or invalid: ${missingFields}.`;
+  const validationResponse = buildValidationResponse(submissionValidation);
+  const customerMessage =
+    "A few details are still needed before Delai can submit this claim.";
 
   const { error: validationUpdateError } =
     await withTimeout(
@@ -1248,7 +1307,7 @@ if (!submissionValidation.readyForSubmission) {
           status: "ready_to_submit",
           submission_status: "awaiting_information",
           submission_attempted_at: attemptedAt,
-          submission_error: validationMessage,
+          submission_error: customerMessage,
           submission_source:
             "universal_submission_validation",
         })
@@ -1265,18 +1324,12 @@ if (!submissionValidation.readyForSubmission) {
   return {
     success: true,
     blocked: true,
-    message: validationMessage,
-    validation: {
-      valid: submissionValidation.valid,
-      blockingIssueCount:
-        submissionValidation.blockingIssueCount,
-      warningCount:
-        submissionValidation.warningCount,
-      errors: submissionValidation.errors,
-      warnings: submissionValidation.warnings,
-      missingFields:
-        submissionValidation.missingFields,
-    },
+    ready: false,
+    message: customerMessage,
+    customer_message: customerMessage,
+    validation: validationResponse,
+    blocking_issues: validationResponse.blocking_issues,
+    missing_fields: validationResponse.missing_fields,
   };
 }
 
@@ -2611,14 +2664,18 @@ app.post("/submit-claim-with-delai", async (req, res) => {
     const validationResponse = buildValidationResponse(validation);
 
     if (!validation.readyForSubmission) {
+      const customerMessage =
+        "A few details are still needed before Delai can submit this claim.";
+
       return res.status(400).json({
         success: false,
         ready: false,
-        message:
-          "A few details are still needed before Delai can submit this claim.",
+        message: customerMessage,
+        customer_message: customerMessage,
         validation: validationResponse,
         blocking_issues: validationResponse.blocking_issues,
         missing_fields: validationResponse.missing_fields,
+        missing_detail_labels: validationResponse.missing_detail_labels,
       });
     }
 
