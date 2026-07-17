@@ -303,6 +303,208 @@ function extractCompensationAmountFromText(claim) {
   return Math.max(...cleanMatches);
 }
 
+
+function normaliseSubmissionIssueText(issue) {
+  if (!issue) {
+    return "";
+  }
+
+  if (typeof issue === "string") {
+    return issue;
+  }
+
+  return (
+    issue.label ||
+    issue.message ||
+    issue.field ||
+    issue.key ||
+    issue.name ||
+    JSON.stringify(issue)
+  );
+}
+
+function getCustomerMissingDetailLabel(issue) {
+  const rawText = normaliseSubmissionIssueText(issue);
+  const readableText = rawText
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const lowerText = readableText.toLowerCase();
+
+  if (!lowerText) {
+    return "A required claim detail is missing.";
+  }
+
+  if (
+    lowerText.includes("smartcard") ||
+    lowerText.includes("smart card")
+  ) {
+    return "Smartcard number is missing.";
+  }
+
+  if (
+    lowerText.includes("booking") ||
+    lowerText.includes("reference")
+  ) {
+    return "Booking reference is missing.";
+  }
+
+  if (
+    lowerText.includes("ticket") &&
+    (lowerText.includes("cost") ||
+      lowerText.includes("price") ||
+      lowerText.includes("fare") ||
+      lowerText.includes("amount"))
+  ) {
+    return "Ticket cost is missing.";
+  }
+
+  if (
+    lowerText.includes("ticket") &&
+    lowerText.includes("type")
+  ) {
+    return "Ticket type is missing.";
+  }
+
+  if (
+    lowerText.includes("ticket") &&
+    (lowerText.includes("origin") ||
+      lowerText.includes("destination") ||
+      lowerText.includes("route") ||
+      lowerText.includes("station"))
+  ) {
+    return "Ticket route is incomplete.";
+  }
+
+  if (
+    lowerText.includes("ticket") &&
+    (lowerText.includes("start") ||
+      lowerText.includes("end") ||
+      lowerText.includes("date"))
+  ) {
+    return "Ticket dates are missing.";
+  }
+
+  if (
+    lowerText.includes("commute") &&
+    (lowerText.includes("origin") ||
+      lowerText.includes("destination") ||
+      lowerText.includes("route") ||
+      lowerText.includes("station"))
+  ) {
+    return "Commute route is incomplete.";
+  }
+
+  if (
+    lowerText.includes("origin") ||
+    lowerText.includes("destination") ||
+    lowerText.includes("station") ||
+    lowerText.includes("route")
+  ) {
+    return "Journey route is incomplete.";
+  }
+
+  if (
+    lowerText.includes("outbound") ||
+    lowerText.includes("return") ||
+    lowerText.includes("travel window") ||
+    lowerText.includes("window") ||
+    lowerText.includes("time")
+  ) {
+    return "Travel window is missing.";
+  }
+
+  if (
+    lowerText.includes("travel days") ||
+    lowerText.includes("travel day")
+  ) {
+    return "Travel days are missing.";
+  }
+
+  if (
+    lowerText.includes("operator") ||
+    lowerText.includes("train company")
+  ) {
+    return "Train operator is missing.";
+  }
+
+  if (
+    lowerText.includes("delay date") ||
+    lowerText.includes("journey date")
+  ) {
+    return "Delay date is missing.";
+  }
+
+  if (
+    lowerText.includes("delay minutes") ||
+    lowerText.includes("delay length") ||
+    lowerText.includes("minutes")
+  ) {
+    return "Delay length is missing.";
+  }
+
+  if (
+    lowerText.includes("profile") ||
+    lowerText.includes("passenger") ||
+    lowerText.includes("full name") ||
+    lowerText.includes("name") ||
+    lowerText.includes("email")
+  ) {
+    return "Passenger contact details are missing.";
+  }
+
+  return `${readableText.charAt(0).toUpperCase()}${readableText.slice(1)} is missing.`;
+}
+
+function buildCustomerBlockingIssues(validation) {
+  const rawIssues = [
+    ...(Array.isArray(validation?.missingFields)
+      ? validation.missingFields
+      : []),
+    ...(Array.isArray(validation?.errors)
+      ? validation.errors
+      : []),
+  ];
+
+  const seenLabels = new Set();
+
+  return rawIssues
+    .map((issue) => {
+      const rawText = normaliseSubmissionIssueText(issue);
+      const label = getCustomerMissingDetailLabel(issue);
+
+      if (!label || seenLabels.has(label)) {
+        return null;
+      }
+
+      seenLabels.add(label);
+
+      return {
+        label,
+        raw: rawText,
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildValidationResponse(validation) {
+  const blockingIssues = buildCustomerBlockingIssues(validation);
+
+  return {
+    valid: validation.valid,
+    ready_for_submission: validation.readyForSubmission,
+    blocking_issue_count: validation.blockingIssueCount,
+    warning_count: validation.warningCount,
+    missing_fields: validation.missingFields,
+    errors: validation.errors,
+    warnings: validation.warnings,
+    blocking_issues: blockingIssues,
+    checked_at: validation.checkedAt,
+    context_version: validation.contextVersion,
+  };
+}
+
 function getClaimOutcomeNotification(outcome) {
   if (outcome === "paid") {
     return {
@@ -2304,17 +2506,7 @@ app.post("/validate-claim-submission", async (req, res) => {
         known_operator:
           submissionContext.operator?.knownOperator === true,
       },
-      validation: {
-        valid: validation.valid,
-        blocking_issue_count:
-          validation.blockingIssueCount,
-        warning_count: validation.warningCount,
-        missing_fields: validation.missingFields,
-        errors: validation.errors,
-        warnings: validation.warnings,
-        checked_at: validation.checkedAt,
-        context_version: validation.contextVersion,
-      },
+      validation: buildValidationResponse(validation),
     });
   } catch (error) {
     console.error(
@@ -2325,6 +2517,212 @@ app.post("/validate-claim-submission", async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Failed to validate claim submission",
+      details: error.message,
+    });
+  }
+});
+
+
+app.post("/submit-claim-with-delai", async (req, res) => {
+  try {
+    const { user_id, claim_id } = req.body || {};
+
+    if (!user_id || !claim_id) {
+      return res.status(400).json({
+        success: false,
+        ready: false,
+        error: "Missing user_id or claim_id",
+      });
+    }
+
+    const { data: claim, error: claimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .maybeSingle(),
+      10000,
+      "Submit with Delai claim lookup"
+    );
+
+    if (claimError) {
+      throw claimError;
+    }
+
+    if (!claim) {
+      return res.status(404).json({
+        success: false,
+        ready: false,
+        error: "Claim not found",
+      });
+    }
+
+    if (claim.status === "submitted") {
+      return res.json({
+        success: true,
+        ready: true,
+        submitted: true,
+        message:
+          "This claim has already been submitted. Delai will continue tracking it automatically.",
+        claim,
+        claim_status: claim.status,
+        submission_status: claim.submission_status || "submitted",
+      });
+    }
+
+    if (!claim.detected_delay_id) {
+      return res.status(400).json({
+        success: false,
+        ready: false,
+        error: "Claim has no linked detected delay",
+      });
+    }
+
+    const { data: detectedDelay, error: delayError } = await withTimeout(
+      supabaseAdmin
+        .from("detected_delays")
+        .select("*")
+        .eq("id", claim.detected_delay_id)
+        .eq("user_id", user_id)
+        .maybeSingle(),
+      10000,
+      "Submit with Delai detected delay lookup"
+    );
+
+    if (delayError) {
+      throw delayError;
+    }
+
+    if (!detectedDelay) {
+      return res.status(404).json({
+        success: false,
+        ready: false,
+        error: "Linked detected delay not found",
+      });
+    }
+
+    const submissionContext = await loadClaimSubmissionContext({
+      claim,
+      detectedDelay,
+    });
+
+    const validation = validateSubmissionContext(submissionContext);
+    const validationResponse = buildValidationResponse(validation);
+
+    if (!validation.readyForSubmission) {
+      return res.status(400).json({
+        success: false,
+        ready: false,
+        message:
+          "A few details are still needed before Delai can submit this claim.",
+        validation: validationResponse,
+        blocking_issues: validationResponse.blocking_issues,
+        missing_fields: validationResponse.missing_fields,
+      });
+    }
+
+    const preparedClaim = await prepareClaimRecord({
+      userId: user_id,
+      claimId: claim_id,
+    });
+
+    const { data: readyClaim, error: readyError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "ready_to_submit",
+          submission_status: "not_started",
+          submission_error: null,
+        })
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Submit with Delai mark ready"
+    );
+
+    if (readyError) {
+      throw readyError;
+    }
+
+    const submissionResult = await processClaimSubmitJob({
+      id: `direct-submit-${claim_id}`,
+      user_id,
+      claim_id,
+      job_type: "claim_submit",
+    });
+
+    const { data: latestClaim, error: latestClaimError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .select("*")
+        .eq("id", claim_id)
+        .eq("user_id", user_id)
+        .maybeSingle(),
+      10000,
+      "Submit with Delai latest claim lookup"
+    );
+
+    if (latestClaimError) {
+      throw latestClaimError;
+    }
+
+    const finalClaim =
+      submissionResult.claim || latestClaim || readyClaim || preparedClaim;
+
+    if (submissionResult.blocked) {
+      const submissionStatus =
+        finalClaim?.submission_status ||
+        submissionResult.submission?.status ||
+        "awaiting_operator_integration";
+
+      const awaitingInformation =
+        submissionStatus === "awaiting_information";
+
+      return res.json({
+        success: true,
+        ready: true,
+        blocked: true,
+        claim: finalClaim,
+        claim_status: finalClaim?.status || "ready_to_submit",
+        submission_status: submissionStatus,
+        validation: validationResponse,
+        submission: submissionResult.submission || submissionResult,
+        message:
+          submissionResult.message ||
+          "Delai could not complete automatic submission yet.",
+        customer_message: awaitingInformation
+          ? "A few details are still needed before Delai can submit this claim."
+          : "This claim is ready, but automatic submission for this train operator is not connected yet.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      ready: true,
+      submitted: finalClaim?.status === "submitted",
+      claim: finalClaim,
+      claim_status: finalClaim?.status || "ready_to_submit",
+      submission_status:
+        finalClaim?.submission_status ||
+        submissionResult.submission?.status ||
+        null,
+      validation: validationResponse,
+      prepared_summary: preparedClaim?.prepared_summary || null,
+      submission: submissionResult,
+      message:
+        submissionResult.message ||
+        "Delai has started the claim submission process.",
+    });
+  } catch (error) {
+    console.error("Submit claim with Delai error:", error);
+
+    return res.status(500).json({
+      success: false,
+      ready: false,
+      error: "Failed to submit claim with Delai",
       details: error.message,
     });
   }
@@ -2417,79 +2815,78 @@ app.post("/mark-claim-submitted", async (req, res) => {
         .select("*")
         .eq("id", claim_id)
         .eq("user_id", user_id)
-        .single(),
+        .maybeSingle(),
       10000,
       "Mark claim submitted lookup"
     );
 
-    if (claimError || !claim) {
+    if (claimError) {
+      throw claimError;
+    }
+
+    if (!claim) {
       return res.status(404).json({
         success: false,
         error: "Claim not found",
       });
     }
 
-    if (claim.status !== "ready_to_submit" && claim.status !== "submitted") {
+    if (claim.status === "submitted") {
+      return res.json({
+        success: true,
+        claim,
+        message:
+          "This claim has already been submitted. Delai will continue tracking it automatically.",
+      });
+    }
+
+    if (claim.status !== "ready_to_submit") {
       return res.status(400).json({
         success: false,
         error:
-          "Claim must be ready to submit before it can be marked as submitted.",
+          "Claim must be ready to submit before Delai can submit it automatically.",
+        current_status: claim.status,
       });
     }
 
-    const submittedAt = claim.submitted_at || new Date().toISOString();
+    const submissionResult = await processClaimSubmitJob({
+      id: `manual-submit-${claim_id}`,
+      user_id,
+      claim_id,
+      job_type: "claim_submit",
+    });
 
-    const { data: updatedClaim, error: updateError } = await withTimeout(
+    const { data: latestClaim, error: latestClaimError } = await withTimeout(
       supabaseAdmin
         .from("claims")
-        .update({
-          status: "submitted",
-          submitted_at: submittedAt,
-        })
+        .select("*")
         .eq("id", claim_id)
         .eq("user_id", user_id)
-        .select("*")
-        .single(),
+        .maybeSingle(),
       10000,
-      "Mark claim submitted update"
+      "Mark claim submitted latest claim lookup"
     );
 
-    if (updateError) {
-      throw updateError;
+    if (latestClaimError) {
+      throw latestClaimError;
     }
 
-    let automationJob = null;
-
-    try {
-      automationJob = await queueAutomationJob({
-        userId: user_id,
-        claimId: claim_id,
-        jobType: "claim_check_outcome",
-      });
-    } catch (automationError) {
-      console.error(
-        "Claim submitted, but automation job could not be queued:",
-        automationError
-      );
-
-      automationJob = {
-        skipped: true,
-        reason: "automation_queue_failed",
-        error: automationError.message,
-      };
-    }
-
-    res.json({
+    return res.json({
       success: true,
-      claim: updatedClaim,
-      automation_job: automationJob,
+      blocked: submissionResult.blocked === true,
+      message:
+        submissionResult.message ||
+        "Delai has started the claim submission process.",
+      claim: submissionResult.claim || latestClaim || claim,
+      submission: submissionResult.submission || submissionResult,
+      automation_job: submissionResult.next_job || null,
     });
   } catch (error) {
     console.error("Mark claim submitted error:", error);
 
     res.status(500).json({
       success: false,
-      error: "Failed to mark claim as submitted",
+      error: "Failed to submit claim automatically",
       details: error.message,
     });
   }
