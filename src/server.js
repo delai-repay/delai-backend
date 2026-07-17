@@ -568,6 +568,23 @@ function buildValidationResponse(validation) {
   };
 }
 
+function buildOperatorIntegrationPendingCopy({ submissionContext, detectedDelay } = {}) {
+  const operatorName =
+    submissionContext?.operator?.displayName ||
+    submissionContext?.operator?.suppliedName ||
+    detectedDelay?.operator ||
+    "this train operator";
+
+  return {
+    customer_status: "operator_submission_pending",
+    customer_title: "Claim ready for Delai submission",
+    customer_message: `Your claim is ready. Delai is preparing automatic submission for ${operatorName}.`,
+    customer_next_step:
+      "No further action is needed right now. Delai has saved the claim details and will continue from here as the operator connection is completed.",
+  };
+}
+
+
 function getClaimOutcomeNotification(outcome) {
   if (outcome === "paid") {
     return {
@@ -1379,11 +1396,23 @@ if (!submissionValidation.readyForSubmission) {
       throw blockUpdateError;
     }
 
+    const operatorPendingCopy = buildOperatorIntegrationPendingCopy({
+      submissionContext,
+      detectedDelay,
+    });
+
     return {
       success: true,
       blocked: true,
-      message: submissionResult.reason,
-      submission: submissionResult,
+      message: operatorPendingCopy.customer_message,
+      customer_message: operatorPendingCopy.customer_message,
+      customer_title: operatorPendingCopy.customer_title,
+      customer_next_step: operatorPendingCopy.customer_next_step,
+      customer_status: operatorPendingCopy.customer_status,
+      submission: {
+        ...submissionResult,
+        ...operatorPendingCopy,
+      },
     };
   }
 
@@ -2738,6 +2767,17 @@ app.post("/submit-claim-with-delai", async (req, res) => {
       const awaitingInformation =
         submissionStatus === "awaiting_information";
 
+      const operatorPendingCopy = buildOperatorIntegrationPendingCopy({
+        submissionContext,
+        detectedDelay,
+      });
+
+      const customerMessage = awaitingInformation
+        ? "A few details are still needed before Delai can submit this claim."
+        : submissionResult.customer_message ||
+          submissionResult.submission?.customer_message ||
+          operatorPendingCopy.customer_message;
+
       return res.json({
         success: true,
         ready: true,
@@ -2747,12 +2787,23 @@ app.post("/submit-claim-with-delai", async (req, res) => {
         submission_status: submissionStatus,
         validation: validationResponse,
         submission: submissionResult.submission || submissionResult,
-        message:
-          submissionResult.message ||
-          "Delai could not complete automatic submission yet.",
-        customer_message: awaitingInformation
-          ? "A few details are still needed before Delai can submit this claim."
-          : "This claim is ready, but automatic submission for this train operator is not connected yet.",
+        message: customerMessage,
+        customer_message: customerMessage,
+        customer_title: awaitingInformation
+          ? "More details needed"
+          : submissionResult.customer_title ||
+            submissionResult.submission?.customer_title ||
+            operatorPendingCopy.customer_title,
+        customer_next_step: awaitingInformation
+          ? "Update the missing details, then Delai will check the claim again automatically."
+          : submissionResult.customer_next_step ||
+            submissionResult.submission?.customer_next_step ||
+            operatorPendingCopy.customer_next_step,
+        customer_status: awaitingInformation
+          ? "awaiting_information"
+          : submissionResult.customer_status ||
+            submissionResult.submission?.customer_status ||
+            operatorPendingCopy.customer_status,
       });
     }
 
