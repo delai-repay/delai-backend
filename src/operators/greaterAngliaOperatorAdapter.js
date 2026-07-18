@@ -3,7 +3,10 @@ import {
   buildGreaterAngliaPortalSubmissionPlan,
   getGreaterAngliaIntegrationStatus,
   getGreaterAngliaSubmissionMode,
+  isGreaterAngliaFinalSubmitEnabled,
+  isGreaterAngliaPlaywrightExecutorEnabled,
 } from "./greaterAngliaDelayRepayPortal.js";
+import { runGreaterAngliaPlaywrightSubmission } from "./greaterAngliaPlaywrightExecutor.js";
 
 function cleanText(value) {
   if (value === undefined || value === null) {
@@ -35,7 +38,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
     });
 
     this.integrationStatus = getGreaterAngliaIntegrationStatus();
-    this.adapterVersion = "greater-anglia-1.1";
+    this.adapterVersion = "greater-anglia-1.2";
     this.submissionStrategy = "playwright_browser_automation";
   }
 
@@ -149,22 +152,68 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
       };
     }
 
+    if (!isGreaterAngliaPlaywrightExecutorEnabled()) {
+      return {
+        submitted: false,
+        blocked: true,
+        reason:
+          "Greater Anglia Playwright submission mode is enabled, but the verified browser executor has not been enabled yet.",
+        source: "greater_anglia_playwright_executor_pending",
+        operator: this.displayName,
+        operatorKey: this.operatorKey,
+        integrationStatus: "playwright_executor_pending",
+        submissionStrategy: this.submissionStrategy,
+        customer_status: "operator_submission_pending",
+        customer_title: "Claim ready for Delai submission",
+        customer_message:
+          "Your claim is ready. Delai is preparing automatic submission for Greater Anglia.",
+        customer_next_step:
+          "No further action is needed right now. Delai has saved the mapped claim details and is waiting for the verified browser executor to be enabled.",
+        mappedSubmission,
+        portalSubmissionPlan,
+      };
+    }
+
+    const executorResult = await runGreaterAngliaPlaywrightSubmission({
+      portalSubmissionPlan,
+      mappedSubmission,
+      finalSubmitEnabled: isGreaterAngliaFinalSubmitEnabled(),
+    });
+
+    if (executorResult.submitted) {
+      return {
+        ...executorResult,
+        operator: this.displayName,
+        operatorKey: this.operatorKey,
+        integrationStatus: "live_submission_enabled",
+        source: executorResult.source || "greater_anglia_playwright_live_submission",
+        submittedAt: executorResult.submittedAt || new Date().toISOString(),
+        operatorReference: executorResult.operatorReference,
+        mappedSubmission,
+        portalSubmissionPlan,
+      };
+    }
+
     return {
+      ...executorResult,
       submitted: false,
       blocked: true,
-      reason:
-        "Greater Anglia Playwright submission mode is enabled, but the verified browser executor has not been connected yet.",
-      source: "greater_anglia_playwright_executor_pending",
       operator: this.displayName,
       operatorKey: this.operatorKey,
-      integrationStatus: "playwright_executor_pending",
+      integrationStatus:
+        executorResult.integrationStatus ||
+        getGreaterAngliaIntegrationStatus(),
       submissionStrategy: this.submissionStrategy,
-      customer_status: "operator_submission_pending",
-      customer_title: "Claim ready for Delai submission",
+      customer_status:
+        executorResult.customer_status || "operator_submission_pending",
+      customer_title:
+        executorResult.customer_title || "Claim ready for Delai submission",
       customer_message:
+        executorResult.customer_message ||
         "Your claim is ready. Delai is preparing automatic submission for Greater Anglia.",
       customer_next_step:
-        "No further action is needed right now. Delai has saved the mapped claim details and is waiting for the verified browser executor.",
+        executorResult.customer_next_step ||
+        "No further action is needed right now. Delai has saved the claim and will continue the operator submission process safely.",
       mappedSubmission,
       portalSubmissionPlan,
     };
@@ -176,8 +225,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
       final: false,
       outcome: "still_waiting",
       blocked: true,
-      reason:
-        "Greater Anglia outcome checking is not connected yet.",
+      reason: "Greater Anglia outcome checking is not connected yet.",
       source: "greater_anglia_outcome_adapter_pending",
       operator: this.displayName,
       operatorKey: this.operatorKey,
@@ -189,8 +237,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
       found: false,
       paid: false,
       blocked: true,
-      reason:
-        "Greater Anglia payment checking is not connected yet.",
+      reason: "Greater Anglia payment checking is not connected yet.",
       source: "greater_anglia_payment_adapter_pending",
       operator: this.displayName,
       operatorKey: this.operatorKey,

@@ -8,7 +8,7 @@ const GREATER_ANGLIA_DELAY_REPAY_PORTAL = {
     "https://greateranglia.delayrepaycompensation.com/index.cfm?action=myclaims.appeal",
   submissionMethod: "playwright_browser_automation",
   provider: "Tracsis Travel Compensation Services",
-  currentStrategyVersion: "greater-anglia-browser-strategy-1.0",
+  currentStrategyVersion: "greater-anglia-browser-strategy-1.1",
 };
 
 const DELAY_BANDS = [
@@ -51,11 +51,17 @@ function cleanText(value) {
   return cleanedValue || null;
 }
 
+function boolEnv(name) {
+  return String(process.env[name] || "").toLowerCase() === "true";
+}
+
 function normaliseTicketType(ticketType) {
-  return cleanText(ticketType)
-    ?.toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "") || "";
+  return (
+    cleanText(ticketType)
+      ?.toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "") || ""
+  );
 }
 
 function splitScheduledTime(value) {
@@ -145,9 +151,17 @@ function buildGreaterAngliaPortalSubmissionPlan(mappedSubmission = {}) {
       liveSubmissionRequiresEnv: [
         "ENABLE_GREATER_ANGLIA_LIVE_SUBMISSION=true",
         "GREATER_ANGLIA_SUBMISSION_METHOD=playwright",
+        "GREATER_ANGLIA_PLAYWRIGHT_EXECUTOR_ENABLED=true",
+        "GREATER_ANGLIA_FINAL_SUBMIT_ENABLED=true",
       ],
-      submitButtonMustRemainBlockedUntilExecutorVerified: true,
-      expectedReferencePrefix: "GA/DR",
+      executorCanRunWithoutFinalSubmit:
+        boolEnv("GREATER_ANGLIA_PLAYWRIGHT_EXECUTOR_ENABLED"),
+      finalSubmitEnabled: boolEnv("GREATER_ANGLIA_FINAL_SUBMIT_ENABLED"),
+      expectedReferenceLabels: [
+        "Your Claim Reference Number",
+        "Claim Reference Number",
+        "Reference Number",
+      ],
     },
     journeyStep: {
       dateOfJourney: cleanText(journey.date),
@@ -166,8 +180,8 @@ function buildGreaterAngliaPortalSubmissionPlan(mappedSubmission = {}) {
       ticketFormat: ticket.smartcardNumber
         ? "Smartcard"
         : ticket.bookingReference
-        ? "Reference"
-        : "Manual ticket details",
+          ? "Reference"
+          : "Manual ticket details",
       smartcardNumber: cleanText(ticket.smartcardNumber),
       uniqueTicketReference: cleanText(ticket.bookingReference),
       originStation: cleanText(ticket.originStation),
@@ -248,14 +262,36 @@ function getGreaterAngliaSubmissionMode() {
   return process.env.GREATER_ANGLIA_SUBMISSION_METHOD || "disabled";
 }
 
+function isGreaterAngliaPlaywrightExecutorEnabled() {
+  return (
+    getGreaterAngliaSubmissionMode() === "playwright" &&
+    boolEnv("GREATER_ANGLIA_PLAYWRIGHT_EXECUTOR_ENABLED")
+  );
+}
+
+function isGreaterAngliaFinalSubmitEnabled() {
+  return (
+    isGreaterAngliaPlaywrightExecutorEnabled() &&
+    boolEnv("GREATER_ANGLIA_FINAL_SUBMIT_ENABLED")
+  );
+}
+
 function getGreaterAngliaIntegrationStatus() {
   const mode = getGreaterAngliaSubmissionMode();
 
-  if (mode === "playwright") {
+  if (mode !== "playwright") {
+    return "browser_automation_strategy_ready";
+  }
+
+  if (!isGreaterAngliaPlaywrightExecutorEnabled()) {
     return "playwright_executor_pending";
   }
 
-  return "browser_automation_strategy_ready";
+  if (isGreaterAngliaFinalSubmitEnabled()) {
+    return "live_submission_enabled";
+  }
+
+  return "playwright_executor_ready_safety_locked";
 }
 
 export {
@@ -264,6 +300,8 @@ export {
   getDelayBand,
   getGreaterAngliaIntegrationStatus,
   getGreaterAngliaSubmissionMode,
+  isGreaterAngliaFinalSubmitEnabled,
+  isGreaterAngliaPlaywrightExecutorEnabled,
   mapTicketTypeToPortal,
   splitScheduledTime,
 };

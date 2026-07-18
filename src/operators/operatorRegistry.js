@@ -2,7 +2,11 @@ import BaseOperatorAdapter from "./baseOperatorAdapter.js";
 import SimulatedOperatorAdapter from "./simulatedOperatorAdapter.js";
 import GreaterAngliaOperatorAdapter from "./greaterAngliaOperatorAdapter.js";
 import { getAllOperators } from "./operatorCatalog.js";
-import { getGreaterAngliaIntegrationStatus } from "./greaterAngliaDelayRepayPortal.js";
+import {
+  getGreaterAngliaIntegrationStatus,
+  isGreaterAngliaFinalSubmitEnabled,
+  isGreaterAngliaPlaywrightExecutorEnabled,
+} from "./greaterAngliaDelayRepayPortal.js";
 
 function normaliseOperatorName(value) {
   return String(value || "")
@@ -82,14 +86,14 @@ function resolveOperatorIdentity(operatorName) {
 function getOperatorIntegrationStatus(operatorName) {
   const identity = resolveOperatorIdentity(operatorName);
   const AdapterClass = OPERATOR_ADAPTERS.get(identity.operatorKey);
+  const isGreaterAnglia = identity.operatorKey === "greater_anglia";
 
   let integrationStatus = "pending_operator_adapter";
 
   if (AdapterClass) {
-    integrationStatus =
-      identity.operatorKey === "greater_anglia"
-        ? getGreaterAngliaIntegrationStatus()
-        : "operator_adapter_registered";
+    integrationStatus = isGreaterAnglia
+      ? getGreaterAngliaIntegrationStatus()
+      : "operator_adapter_registered";
   }
 
   return {
@@ -98,10 +102,12 @@ function getOperatorIntegrationStatus(operatorName) {
     knownOperator: identity.knownOperator,
     adapterRegistered: Boolean(AdapterClass),
     integrationStatus,
+    playwrightExecutorEnabled:
+      isGreaterAnglia && isGreaterAngliaPlaywrightExecutorEnabled(),
+    finalSubmitEnabled:
+      isGreaterAnglia && isGreaterAngliaFinalSubmitEnabled(),
     liveSubmissionEnabled:
-      identity.operatorKey === "greater_anglia" &&
-      process.env.ENABLE_GREATER_ANGLIA_LIVE_SUBMISSION === "true" &&
-      process.env.GREATER_ANGLIA_SUBMISSION_METHOD === "playwright",
+      isGreaterAnglia && isGreaterAngliaFinalSubmitEnabled(),
   };
 }
 
