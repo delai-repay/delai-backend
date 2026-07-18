@@ -1,45 +1,43 @@
 import BaseOperatorAdapter from "./baseOperatorAdapter.js";
 
+function normaliseReferencePart(value) {
+  return String(value || "sim")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24);
+}
+
 class SimulatedOperatorAdapter extends BaseOperatorAdapter {
-  async submitClaim({
-    claim,
-    detectedDelay,
-    submissionContext,
-  }) {
-    if (!claim?.id) {
-      throw new Error(
-        "A claim ID is required for simulated operator submission."
-      );
-    }
+  constructor({ operatorKey, displayName } = {}) {
+    super({
+      operatorKey: operatorKey || "simulated_operator",
+      displayName: displayName || "Simulated train operator",
+    });
+  }
 
-    if (!submissionContext?.contextVersion) {
-      throw new Error(
-        "A valid universal submission context is required."
-      );
-    }
-
-    const operator =
-      submissionContext.operator?.displayName ||
-      detectedDelay?.operator ||
-      this.displayName ||
-      "Test operator";
-
-    const operatorReference = `TEST-${claim.id
-      .replaceAll("-", "")
-      .slice(0, 10)
-      .toUpperCase()}`;
+  async submitClaim({ claim, detectedDelay, submissionContext } = {}) {
+    const submittedAt = new Date().toISOString();
+    const referenceOperator = normaliseReferencePart(
+      submissionContext?.operator?.key || this.operatorKey
+    );
+    const referenceClaim = normaliseReferencePart(
+      claim?.id || submissionContext?.claim?.id || detectedDelay?.id || Date.now()
+    );
 
     return {
       submitted: true,
       blocked: false,
-      operatorReference,
-      submittedAt: new Date().toISOString(),
+      operatorReference: `SIM-${referenceOperator}-${referenceClaim}`,
+      submittedAt,
       source: "simulated_operator_adapter",
-      operator,
-      operatorKey:
-        submissionContext.operator?.key ||
-        this.operatorKey,
-      contextVersion: submissionContext.contextVersion,
+      operator: this.displayName,
+      operatorKey: this.operatorKey,
+      mappedSubmission: this.buildSubmissionPayload({
+        claim,
+        detectedDelay,
+        submissionContext,
+      }),
     };
   }
 }

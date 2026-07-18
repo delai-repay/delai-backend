@@ -1,69 +1,106 @@
 import BaseOperatorAdapter from "./baseOperatorAdapter.js";
 import SimulatedOperatorAdapter from "./simulatedOperatorAdapter.js";
-import {
-  getOperatorByKey,
-  normaliseOperatorName,
-  resolveOperator,
-} from "./operatorCatalog.js";
+import GreaterAngliaOperatorAdapter from "./greaterAngliaOperatorAdapter.js";
+import { getAllOperators } from "./operatorCatalog.js";
 
-const registeredOperatorAdapters = new Map();
+function normaliseOperatorName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function getCatalogOperators() {
+  try {
+    const operators = getAllOperators();
+    return Array.isArray(operators) ? operators : [];
+  } catch (error) {
+    console.error("Operator catalogue lookup failed:", error);
+    return [];
+  }
+}
+
+function buildOperatorLookup() {
+  const lookup = new Map();
+
+  for (const operator of getCatalogOperators()) {
+    const key = operator.key || normaliseOperatorName(operator.displayName);
+    const displayName = operator.displayName || operator.display_name || key;
+    const aliases = Array.isArray(operator.aliases) ? operator.aliases : [];
+
+    const values = [key, displayName, operator.display_name, ...aliases];
+
+    for (const value of values) {
+      const normalisedValue = normaliseOperatorName(value);
+
+      if (normalisedValue) {
+        lookup.set(normalisedValue, {
+          operatorKey: key,
+          displayName,
+          aliases,
+          knownOperator: true,
+        });
+      }
+    }
+  }
+
+  return lookup;
+}
+
+const OPERATOR_ADAPTERS = new Map([
+  ["greater_anglia", GreaterAngliaOperatorAdapter],
+]);
 
 function resolveOperatorIdentity(operatorName) {
-  const suppliedName = String(operatorName || "").trim();
-  const catalogOperator = resolveOperator(suppliedName);
+  const normalisedOperator = normaliseOperatorName(operatorName);
+  const lookup = buildOperatorLookup();
 
-  if (catalogOperator) {
+  if (lookup.has(normalisedOperator)) {
+    return lookup.get(normalisedOperator);
+  }
+
+  if (normalisedOperator === "greater_anglia") {
     return {
-      operatorKey: catalogOperator.key,
-      displayName: catalogOperator.displayName,
+      operatorKey: "greater_anglia",
+      displayName: "Greater Anglia",
+      aliases: ["Greater Anglia", "GA", "Abellio Greater Anglia"],
       knownOperator: true,
     };
   }
 
   return {
-    operatorKey:
-      normaliseOperatorName(suppliedName) || "unknown_operator",
-    displayName: suppliedName || "Unknown train operator",
+    operatorKey: normalisedOperator || "unknown_operator",
+    displayName: operatorName || "Unknown train operator",
+    aliases: [],
     knownOperator: false,
   };
 }
 
-function registerOperatorAdapter({
-  operatorKey,
-  names = [],
-  createAdapter,
-}) {
-  if (typeof createAdapter !== "function") {
-    throw new Error(
-      "registerOperatorAdapter requires a createAdapter function."
-    );
-  }
+function getOperatorIntegrationStatus(operatorName) {
+  const identity = resolveOperatorIdentity(operatorName);
+  const AdapterClass = OPERATOR_ADAPTERS.get(identity.operatorKey);
+  const isGreaterAnglia = identity.operatorKey === "greater_anglia";
+  const liveSubmissionEnabled =
+    isGreaterAnglia &&
+    process.env.ENABLE_GREATER_ANGLIA_LIVE_SUBMISSION === "true";
 
-  const catalogOperator = operatorKey
-    ? getOperatorByKey(operatorKey)
-    : names
-        .map((name) => resolveOperator(name))
-        .find(Boolean);
-
-  const registryKey =
-    catalogOperator?.key ||
-    normaliseOperatorName(operatorKey || names[0]);
-
-  if (!registryKey) {
-    throw new Error(
-      "registerOperatorAdapter requires a valid operator key or name."
-    );
-  }
-
-  registeredOperatorAdapters.set(registryKey, createAdapter);
-
-  return registryKey;
+  return {
+    operatorKey: identity.operatorKey,
+    displayName: identity.displayName,
+    knownOperator: identity.knownOperator,
+    adapterRegistered: Boolean(AdapterClass),
+    integrationStatus: AdapterClass
+      ? liveSubmissionEnabled
+        ? "live_transport_not_implemented"
+        : "structured_mapping_ready"
+      : "pending_operator_adapter",
+    liveSubmissionEnabled,
+  };
 }
 
-function getOperatorAdapter({
-  operator,
-  allowSimulation = false,
-} = {}) {
+function getOperatorAdapter({ operator, allowSimulation = false } = {}) {
   const identity = resolveOperatorIdentity(operator);
 
   if (allowSimulation) {
@@ -73,15 +110,10 @@ function getOperatorAdapter({
     });
   }
 
-  const createAdapter = registeredOperatorAdapters.get(
-    identity.operatorKey
-  );
+  const AdapterClass = OPERATOR_ADAPTERS.get(identity.operatorKey);
 
-  if (createAdapter) {
-    return createAdapter({
-      operatorKey: identity.operatorKey,
-      displayName: identity.displayName,
-    });
+  if (AdapterClass) {
+    return new AdapterClass();
   }
 
   return new BaseOperatorAdapter({
@@ -90,32 +122,9 @@ function getOperatorAdapter({
   });
 }
 
-function getOperatorIntegrationStatus(operatorName) {
-  const identity = resolveOperatorIdentity(operatorName);
-
-  const adapterRegistered = registeredOperatorAdapters.has(
-    identity.operatorKey
-  );
-
-  return {
-    operatorKey: identity.operatorKey,
-    displayName: identity.displayName,
-    knownOperator: identity.knownOperator,
-    adapterRegistered,
-    integrationStatus: adapterRegistered
-      ? "connected"
-      : "awaiting_integration",
-  };
-}
-
-function getRegisteredOperatorKeys() {
-  return Array.from(registeredOperatorAdapters.keys());
-}
-
 export {
   getOperatorAdapter,
   getOperatorIntegrationStatus,
-  getRegisteredOperatorKeys,
-  registerOperatorAdapter,
+  normaliseOperatorName,
   resolveOperatorIdentity,
 };

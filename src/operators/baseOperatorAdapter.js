@@ -4,7 +4,31 @@ class BaseOperatorAdapter {
     this.displayName = displayName || "Unknown train operator";
   }
 
-  async submitClaim() {
+  buildSubmissionPayload({ claim, detectedDelay, submissionContext } = {}) {
+    return {
+      operator: {
+        key: this.operatorKey,
+        displayName: this.displayName,
+      },
+      claim: {
+        id: claim?.id || submissionContext?.claim?.id || null,
+        detectedDelayId:
+          claim?.detected_delay_id ||
+          submissionContext?.claim?.detectedDelayId ||
+          detectedDelay?.id ||
+          null,
+        userId: claim?.user_id || submissionContext?.claim?.userId || null,
+      },
+      passenger: submissionContext?.passenger || {},
+      journey: submissionContext?.journey || {},
+      ticket: submissionContext?.ticket || {},
+      commute: submissionContext?.commute || {},
+      generatedAt: new Date().toISOString(),
+      adapterVersion: "base-1.0",
+    };
+  }
+
+  async submitClaim({ claim, detectedDelay, submissionContext } = {}) {
     return {
       submitted: false,
       blocked: true,
@@ -12,6 +36,11 @@ class BaseOperatorAdapter {
       source: "operator_adapter_not_connected",
       operator: this.displayName,
       operatorKey: this.operatorKey,
+      mappedSubmission: this.buildSubmissionPayload({
+        claim,
+        detectedDelay,
+        submissionContext,
+      }),
     };
   }
 
