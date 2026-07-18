@@ -1,4 +1,9 @@
 import BaseOperatorAdapter from "./baseOperatorAdapter.js";
+import {
+  buildGreaterAngliaPortalSubmissionPlan,
+  getGreaterAngliaIntegrationStatus,
+  getGreaterAngliaSubmissionMode,
+} from "./greaterAngliaDelayRepayPortal.js";
 
 function cleanText(value) {
   if (value === undefined || value === null) {
@@ -29,8 +34,9 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
       displayName: "Greater Anglia",
     });
 
-    this.integrationStatus = "structured_mapping_ready";
-    this.adapterVersion = "greater-anglia-1.0";
+    this.integrationStatus = getGreaterAngliaIntegrationStatus();
+    this.adapterVersion = "greater-anglia-1.1";
+    this.submissionStrategy = "playwright_browser_automation";
   }
 
   buildSubmissionPayload({ claim, detectedDelay, submissionContext } = {}) {
@@ -46,7 +52,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         key: this.operatorKey,
         displayName: this.displayName,
         claimPortal: "Greater Anglia Delay Repay",
-        submissionMode: "structured_mapping",
+        submissionMode: this.submissionStrategy,
       },
       claim: {
         id: claim?.id || submissionContext?.claim?.id || null,
@@ -67,6 +73,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         townCity: cleanText(passenger.townCity),
         postcode: cleanText(passenger.postcode),
         country: cleanText(passenger.country) || "United Kingdom",
+        preferredPaymentMethod: cleanText(passenger.preferredPaymentMethod),
       },
       journey: {
         date: cleanText(journey.date),
@@ -114,26 +121,31 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
       submissionContext,
     });
 
-    const liveSubmissionEnabled =
-      process.env.ENABLE_GREATER_ANGLIA_LIVE_SUBMISSION === "true";
+    const portalSubmissionPlan = buildGreaterAngliaPortalSubmissionPlan(
+      mappedSubmission
+    );
 
-    if (!liveSubmissionEnabled) {
+    const submissionMode = getGreaterAngliaSubmissionMode();
+
+    if (submissionMode !== "playwright") {
       return {
         submitted: false,
         blocked: true,
         reason:
-          "Greater Anglia structured submission mapping is ready, but live external submission is not enabled yet.",
-        source: "greater_anglia_structured_adapter_pending_live_submission",
+          "Greater Anglia browser automation strategy is ready, but live external submission is not enabled yet.",
+        source: "greater_anglia_browser_automation_strategy_ready",
         operator: this.displayName,
         operatorKey: this.operatorKey,
         integrationStatus: this.integrationStatus,
+        submissionStrategy: this.submissionStrategy,
         customer_status: "operator_submission_pending",
         customer_title: "Claim ready for Delai submission",
         customer_message:
           "Your claim is ready. Delai is preparing automatic submission for Greater Anglia.",
         customer_next_step:
-          "No further action is needed right now. Delai has saved the mapped claim details and will continue once the live operator connection is enabled.",
+          "No further action is needed right now. Delai has saved the mapped claim details and will continue once live submission is enabled.",
         mappedSubmission,
+        portalSubmissionPlan,
       };
     }
 
@@ -141,18 +153,20 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
       submitted: false,
       blocked: true,
       reason:
-        "Greater Anglia live submission was enabled, but the live transport connector has not been implemented yet.",
-      source: "greater_anglia_live_transport_not_implemented",
+        "Greater Anglia Playwright submission mode is enabled, but the verified browser executor has not been connected yet.",
+      source: "greater_anglia_playwright_executor_pending",
       operator: this.displayName,
       operatorKey: this.operatorKey,
-      integrationStatus: "live_transport_not_implemented",
+      integrationStatus: "playwright_executor_pending",
+      submissionStrategy: this.submissionStrategy,
       customer_status: "operator_submission_pending",
       customer_title: "Claim ready for Delai submission",
       customer_message:
         "Your claim is ready. Delai is preparing automatic submission for Greater Anglia.",
       customer_next_step:
-        "No further action is needed right now. Delai has saved the mapped claim details and will continue once the live transport connector is completed.",
+        "No further action is needed right now. Delai has saved the mapped claim details and is waiting for the verified browser executor.",
       mappedSubmission,
+      portalSubmissionPlan,
     };
   }
 
