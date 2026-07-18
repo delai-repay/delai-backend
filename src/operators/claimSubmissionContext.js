@@ -44,9 +44,7 @@ function buildClaimSubmissionContext({
   commute = null,
 }) {
   if (!claim?.id) {
-    throw new Error(
-      "A valid claim is required to build submission context."
-    );
+    throw new Error("A valid claim is required to build submission context.");
   }
 
   if (!detectedDelay?.id) {
@@ -56,16 +54,12 @@ function buildClaimSubmissionContext({
   }
 
   const rawOperatorName =
-    detectedDelay.operator ||
-    commute?.operator ||
-    seasonTicket?.operator ||
-    null;
+    detectedDelay.operator || commute?.operator || seasonTicket?.operator || null;
 
-  const operatorIdentity =
-    resolveOperatorIdentity(rawOperatorName);
+  const operatorIdentity = resolveOperatorIdentity(rawOperatorName);
 
   return {
-    contextVersion: "1.0",
+    contextVersion: "1.1",
     generatedAt: new Date().toISOString(),
 
     claim: {
@@ -76,8 +70,7 @@ function buildClaimSubmissionContext({
       preparedSummary: cleanText(claim.prepared_summary),
       preparedAt: claim.prepared_at || null,
       submissionStatus: claim.submission_status || null,
-      existingOperatorReference:
-        cleanText(claim.operator_reference),
+      existingOperatorReference: cleanText(claim.operator_reference),
     },
 
     operator: {
@@ -88,25 +81,45 @@ function buildClaimSubmissionContext({
     },
 
     passenger: {
-    fullName:
-    cleanText(profile?.full_name) ||
-    cleanText(profile?.name) ||
-    cleanText(
-      authUser?.user_metadata?.full_name
-    ) ||
-    cleanText(authUser?.user_metadata?.name),
+      fullName:
+        cleanText(profile?.full_name) ||
+        cleanText(profile?.name) ||
+        cleanText(authUser?.user_metadata?.full_name) ||
+        cleanText(authUser?.user_metadata?.name),
 
-    email:
-    cleanText(profile?.email) ||
-    cleanText(authUser?.email) ||
-    cleanText(authUser?.user_metadata?.email),
+      email:
+        cleanText(profile?.email) ||
+        cleanText(authUser?.email) ||
+        cleanText(authUser?.user_metadata?.email),
 
-    mobile:
-    cleanText(profile?.mobile) ||
-    cleanText(profile?.phone) ||
-    cleanText(authUser?.phone) ||
-    cleanText(authUser?.user_metadata?.phone),
-  },
+      mobile:
+        cleanText(profile?.mobile) ||
+        cleanText(profile?.phone) ||
+        cleanText(authUser?.phone) ||
+        cleanText(authUser?.user_metadata?.phone),
+
+      addressLine1:
+        cleanText(profile?.address_line_1) ||
+        cleanText(profile?.address1) ||
+        cleanText(profile?.address_line1),
+
+      addressLine2:
+        cleanText(profile?.address_line_2) ||
+        cleanText(profile?.address2) ||
+        cleanText(profile?.address_line2),
+
+      townCity:
+        cleanText(profile?.town_city) ||
+        cleanText(profile?.city) ||
+        cleanText(profile?.town),
+
+      postcode:
+        cleanText(profile?.postcode) ||
+        cleanText(profile?.postal_code) ||
+        cleanText(profile?.post_code),
+
+      country: cleanText(profile?.country) || "United Kingdom",
+    },
 
     journey: {
       delayId: detectedDelay.id,
@@ -120,65 +133,49 @@ function buildClaimSubmissionContext({
         cleanText(commute?.destination_station),
       direction: cleanText(detectedDelay.direction),
       travelWindow: cleanText(detectedDelay.travel_window),
-      scheduledTime: cleanText(
-        detectedDelay.scheduled_time
-      ),
+      scheduledTime: cleanText(detectedDelay.scheduled_time),
       actualTime: cleanText(detectedDelay.actual_time),
-      delayMinutes: cleanNumber(
-        detectedDelay.delay_minutes
-      ),
+      delayMinutes: cleanNumber(detectedDelay.delay_minutes),
       source: cleanText(detectedDelay.source),
     },
 
     ticket: {
-  id: seasonTicket?.id || null,
+      id: seasonTicket?.id || null,
 
-  type: cleanText(seasonTicket?.ticket_type),
+      type: cleanText(seasonTicket?.ticket_type),
 
-  cost: cleanNumber(
-    seasonTicket?.ticket_cost ??
-      seasonTicket?.cost ??
-      seasonTicket?.purchase_price
-  ),
+      cost: cleanNumber(
+        seasonTicket?.ticket_cost ??
+          seasonTicket?.cost ??
+          seasonTicket?.purchase_price
+      ),
 
-  originStation: cleanText(
-    seasonTicket?.origin_station
-  ),
+      originStation: cleanText(seasonTicket?.origin_station),
 
-  destinationStation: cleanText(
-    seasonTicket?.destination_station
-  ),
+      destinationStation: cleanText(seasonTicket?.destination_station),
 
-  startDate:
-    seasonTicket?.ticket_start_date ||
-    seasonTicket?.valid_from ||
-    null,
+      startDate:
+        seasonTicket?.ticket_start_date || seasonTicket?.valid_from || null,
 
-  endDate:
-    seasonTicket?.ticket_end_date ||
-    seasonTicket?.valid_until ||
-    null,
+      endDate:
+        seasonTicket?.ticket_end_date || seasonTicket?.valid_until || null,
 
-  bookingReference:
-    cleanText(seasonTicket?.booking_reference) ||
-    cleanText(seasonTicket?.booking_ref) ||
-    cleanText(seasonTicket?.ticket_reference),
+      bookingReference:
+        cleanText(seasonTicket?.booking_reference) ||
+        cleanText(seasonTicket?.booking_ref) ||
+        cleanText(seasonTicket?.ticket_reference),
 
-  smartcardProvider:
-    cleanText(seasonTicket?.smartcard_provider) ||
-    cleanText(seasonTicket?.operator),
+      smartcardProvider:
+        cleanText(seasonTicket?.smartcard_provider) ||
+        cleanText(seasonTicket?.operator),
 
-  smartcardNumber: cleanText(
-    seasonTicket?.smartcard_number
-  ),
-},
+      smartcardNumber: cleanText(seasonTicket?.smartcard_number),
+    },
 
     commute: {
       id: commute?.id || null,
       originStation: cleanText(commute?.origin_station),
-      destinationStation: cleanText(
-        commute?.destination_station
-      ),
+      destinationStation: cleanText(commute?.destination_station),
       outboundTime: cleanText(commute?.outbound_time),
       returnTime: cleanText(commute?.return_time),
       travelDays: cleanTravelDays(commute?.travel_days),
@@ -187,6 +184,4 @@ function buildClaimSubmissionContext({
   };
 }
 
-export {
-  buildClaimSubmissionContext,
-};
+export { buildClaimSubmissionContext };

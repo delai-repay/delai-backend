@@ -29,12 +29,7 @@ function looksLikeExactTime(value) {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(cleanValue);
 }
 
-function createIssue({
-  code,
-  field,
-  message,
-  severity = "error",
-}) {
+function createIssue({ code, field, message, severity = "error" }) {
   return {
     code,
     field,
@@ -104,11 +99,7 @@ function validateSubmissionContext(submissionContext) {
   const ticket = submissionContext.ticket || {};
 
   if (!claim.id) {
-    addError(
-      "missing_claim_id",
-      "claim.id",
-      "The claim ID is missing."
-    );
+    addError("missing_claim_id", "claim.id", "The claim ID is missing.");
   }
 
   if (!claim.userId) {
@@ -165,6 +156,30 @@ function validateSubmissionContext(submissionContext) {
     );
   }
 
+  if (!passenger.addressLine1) {
+    addWarning(
+      "missing_passenger_address_line_1",
+      "passenger.addressLine1",
+      "The passenger's address line 1 is missing. Some operators may require it."
+    );
+  }
+
+  if (!passenger.postcode) {
+    addWarning(
+      "missing_passenger_postcode",
+      "passenger.postcode",
+      "The passenger's postcode is missing. Some operators may require it."
+    );
+  }
+
+  if (!passenger.country) {
+    addWarning(
+      "missing_passenger_country",
+      "passenger.country",
+      "The passenger's country is missing."
+    );
+  }
+
   if (!journey.date) {
     addError(
       "missing_journey_date",
@@ -203,10 +218,7 @@ function validateSubmissionContext(submissionContext) {
     );
   }
 
-  if (
-    journey.delayMinutes === null ||
-    journey.delayMinutes === undefined
-  ) {
+  if (journey.delayMinutes === null || journey.delayMinutes === undefined) {
     addError(
       "missing_delay_minutes",
       "journey.delayMinutes",
@@ -247,9 +259,11 @@ function validateSubmissionContext(submissionContext) {
 
   const dailyTicketTypes = new Set([
     "daily",
+    "daily_ticket",
     "day",
     "single",
     "return",
+    "single_return",
     "advance",
     "anytime",
     "off_peak",
@@ -258,19 +272,19 @@ function validateSubmissionContext(submissionContext) {
   ]);
 
   const smartcardTicketTypes = new Set([
-  "weekly",
-  "weekly_season_ticket",
-  "monthly",
-  "monthly_season_ticket",
-  "annual",
-  "annual_season_ticket",
-  "season",
-  "season_ticket",
-  "flexi",
-  "flexi_season",
-  "flexi_season_ticket",
-  "other",
-]);
+    "weekly",
+    "weekly_season_ticket",
+    "monthly",
+    "monthly_season_ticket",
+    "annual",
+    "annual_season_ticket",
+    "season",
+    "season_ticket",
+    "flexi",
+    "flexi_season",
+    "flexi_season_ticket",
+    "other",
+  ]);
 
   if (dailyTicketTypes.has(ticketType)) {
     if (!ticket.bookingReference) {
@@ -355,13 +369,8 @@ function validateSubmissionContext(submissionContext) {
     warningCount: warnings.length,
     errors,
     warnings,
-    missingFields: [
-      ...new Set(errors.map((issue) => issue.field)),
-    ],
+    missingFields: [...new Set(errors.map((issue) => issue.field))],
   };
 }
 
-export {
-  normaliseTicketType,
-  validateSubmissionContext,
-};
+export { normaliseTicketType, validateSubmissionContext };
