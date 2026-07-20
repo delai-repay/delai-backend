@@ -1,3 +1,6 @@
+import path from "node:path";
+import { mkdir } from "node:fs/promises";
+
 const DEFAULT_TIMEOUT_MS = 45000;
 
 function cleanText(value) {
@@ -29,6 +32,34 @@ function getNumberEnv(name, fallback) {
   return value;
 }
 
+function createSafeRunId(prefix = "greater-anglia") {
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[^0-9]/g, "")
+    .slice(0, 14);
+
+  const randomPart = Math.random().toString(36).slice(2, 8);
+  return `${prefix}-${timestamp}-${randomPart}`;
+}
+
+function getScreenshotDir() {
+  return (
+    cleanText(process.env.GREATER_ANGLIA_SCREENSHOT_DIR) ||
+    "./operator-run-artifacts"
+  );
+}
+
+function addLog(runContext, message, details = {}) {
+  const logEntry = {
+    message,
+    at: new Date().toISOString(),
+    ...details,
+  };
+
+  runContext.logs.push(logEntry);
+  console.log(`[Greater Anglia Playwright] ${message}`, details);
+}
+
 function normaliseDateForInput(value) {
   const cleanValue = cleanText(value);
 
@@ -51,13 +82,21 @@ function normaliseDateForInput(value) {
   return date.toISOString().split("T")[0];
 }
 
-function createRunContext() {
+function createRunContext({ mappedSubmission = null, finalSubmitEnabled = false } = {}) {
   return {
+    runId: createSafeRunId(),
+    operator: "Greater Anglia",
+    operatorKey: "greater_anglia",
+    claimId: mappedSubmission?.claim?.id || null,
+    detectedDelayId: mappedSubmission?.claim?.detectedDelayId || null,
     startedAt: new Date().toISOString(),
     completedAt: null,
+    finalSubmitEnabled: finalSubmitEnabled === true,
+    screenshotDir: getScreenshotDir(),
     steps: [],
     warnings: [],
     screenshots: [],
+    logs: [],
   };
 }
 
@@ -90,23 +129,47 @@ async function loadPlaywright() {
 
 async function captureScreenshot(page, runContext, name) {
   if (!getBooleanEnv("GREATER_ANGLIA_CAPTURE_SCREENSHOTS", true)) {
+    addLog(runContext, "Screenshot skipped because capture is disabled.", {
+      name,
+    });
+
     return null;
   }
 
-  const screenshotDir =
-    cleanText(process.env.GREATER_ANGLIA_SCREENSHOT_DIR) ||
-    "./operator-run-artifacts";
+  if (!page) {
+    addWarning(runContext, "Screenshot could not be captured because no page exists yet.", {
+      name,
+    });
 
+    return null;
+  }
+
+  const screenshotDir = runContext.screenshotDir || getScreenshotDir();
   const safeName = name.replace(/[^a-z0-9_-]+/gi, "_").toLowerCase();
-  const filePath = `${screenshotDir}/greater-anglia-${Date.now()}-${safeName}.png`;
+  const filePath = path.join(
+    screenshotDir,
+    `${runContext.runId}-${safeName}.png`
+  );
 
   try {
+    await mkdir(screenshotDir, { recursive: true });
     await page.screenshot({ path: filePath, fullPage: true });
-    runContext.screenshots.push(filePath);
+
+    const screenshotRecord = {
+      name,
+      path: filePath,
+      url: typeof page.url === "function" ? page.url() : null,
+      capturedAt: new Date().toISOString(),
+    };
+
+    runContext.screenshots.push(screenshotRecord);
+    addLog(runContext, "Screenshot saved.", screenshotRecord);
+
     return filePath;
   } catch (error) {
     addWarning(runContext, "Screenshot could not be captured.", {
       name,
+      path: filePath,
       error: error.message,
     });
 
@@ -489,11 +552,24 @@ async function runGreaterAngliaPlaywrightSubmission({
   mappedSubmission,
   finalSubmitEnabled = false,
 } = {}) {
+  const runContext = createRunContext({
+    mappedSubmission,
+    finalSubmitEnabled,
+  });
+
   if (!portalSubmissionPlan) {
+    runContext.completedAt = new Date().toISOString();
+    addWarning(runContext, "Portal submission plan missing.");
     throw new Error("A Greater Anglia portal submission plan is required.");
   }
 
   if (portalSubmissionPlan.automationReadiness?.readyForBrowserAutomation === false) {
+    runContext.completedAt = new Date().toISOString();
+    addWarning(runContext, "Browser automation missing required mapped inputs.", {
+      missingAutomationInputs:
+        portalSubmissionPlan.automationReadiness.missingAutomationInputs || [],
+    });
+
     return {
       submitted: false,
       blocked: true,
@@ -504,6 +580,8 @@ async function runGreaterAngliaPlaywrightSubmission({
       operator: "Greater Anglia",
       operatorKey: "greater_anglia",
       integrationStatus: "playwright_executor_ready_safety_locked",
+      finalSubmitEnabled: finalSubmitEnabled === true,
+      runContext,
     };
   }
 
@@ -512,8 +590,8 @@ async function runGreaterAngliaPlaywrightSubmission({
     DEFAULT_TIMEOUT_MS
   );
 
-  const runContext = createRunContext();
   let browser = null;
+  let page = null;
 
   try {
     const { chromium } = await loadPlaywright();
@@ -528,8 +606,14 @@ async function runGreaterAngliaPlaywrightSubmission({
         "Mozilla/5.0 DelaiBot/1.0 (+https://delaiapp.com; Delay Repay claim automation)",
     });
 
-    const page = await context.newPage();
+    page = await context.newPage();
     page.setDefaultTimeout(timeoutMs);
+
+    addLog(runContext, "Browser opened.", {
+      headless: getBooleanEnv("GREATER_ANGLIA_PLAYWRIGHT_HEADLESS", true),
+      timeoutMs,
+      finalSubmitEnabled: finalSubmitEnabled === true,
+    });
 
     const startClaimUrl = portalSubmissionPlan.portal?.startClaimUrl;
 
@@ -546,6 +630,7 @@ async function runGreaterAngliaPlaywrightSubmission({
     await captureScreenshot(page, runContext, "01_portal_opened");
 
     await clickByText(page, runContext, "accept cookies if shown", /accept|agree|allow all/i);
+    await captureScreenshot(page, runContext, "01b_after_cookie_check");
 
     await fillJourneyStep(page, runContext, portalSubmissionPlan);
     await captureScreenshot(page, runContext, "02_after_journey_step");
@@ -560,6 +645,10 @@ async function runGreaterAngliaPlaywrightSubmission({
     await captureScreenshot(page, runContext, "05_before_final_confirmation");
 
     if (!finalSubmitEnabled) {
+      addStep(runContext, "Final submit safety lock active", {
+        finalSubmitEnabled: false,
+      });
+      await captureScreenshot(page, runContext, "05_safety_lock_final_submit_disabled");
       runContext.completedAt = new Date().toISOString();
 
       return {
@@ -610,6 +699,7 @@ async function runGreaterAngliaPlaywrightSubmission({
       integrationStatus: "live_submission_enabled",
       submittedAt: new Date().toISOString(),
       operatorReference,
+      finalSubmitEnabled: true,
       runContext,
       mappedSubmission,
     };
@@ -618,6 +708,10 @@ async function runGreaterAngliaPlaywrightSubmission({
     addWarning(runContext, "Greater Anglia Playwright executor failed.", {
       error: error.message,
     });
+
+    if (page) {
+      await captureScreenshot(page, runContext, "99_error_state");
+    }
 
     return {
       submitted: false,
@@ -633,6 +727,7 @@ async function runGreaterAngliaPlaywrightSubmission({
         "Your claim is ready. Delai is preparing automatic submission for Greater Anglia.",
       customer_next_step:
         "No further action is needed right now. Delai has saved the claim and will retry once the browser automation issue is resolved.",
+      finalSubmitEnabled: finalSubmitEnabled === true,
       runContext,
       mappedSubmission,
     };

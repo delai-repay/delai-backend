@@ -38,7 +38,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
     });
 
     this.integrationStatus = getGreaterAngliaIntegrationStatus();
-    this.adapterVersion = "greater-anglia-1.2";
+    this.adapterVersion = "greater-anglia-1.3-audit";
     this.submissionStrategy = "playwright_browser_automation";
   }
 
@@ -129,6 +129,8 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
     );
 
     const submissionMode = getGreaterAngliaSubmissionMode();
+    const playwrightExecutorEnabled = isGreaterAngliaPlaywrightExecutorEnabled();
+    const finalSubmitEnabled = isGreaterAngliaFinalSubmitEnabled();
 
     if (submissionMode !== "playwright") {
       return {
@@ -141,6 +143,8 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         operatorKey: this.operatorKey,
         integrationStatus: this.integrationStatus,
         submissionStrategy: this.submissionStrategy,
+        playwrightExecutorEnabled,
+        finalSubmitEnabled,
         customer_status: "operator_submission_pending",
         customer_title: "Claim ready for Delai submission",
         customer_message:
@@ -152,7 +156,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
       };
     }
 
-    if (!isGreaterAngliaPlaywrightExecutorEnabled()) {
+    if (!playwrightExecutorEnabled) {
       return {
         submitted: false,
         blocked: true,
@@ -163,6 +167,8 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         operatorKey: this.operatorKey,
         integrationStatus: "playwright_executor_pending",
         submissionStrategy: this.submissionStrategy,
+        playwrightExecutorEnabled,
+        finalSubmitEnabled,
         customer_status: "operator_submission_pending",
         customer_title: "Claim ready for Delai submission",
         customer_message:
@@ -177,7 +183,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
     const executorResult = await runGreaterAngliaPlaywrightSubmission({
       portalSubmissionPlan,
       mappedSubmission,
-      finalSubmitEnabled: isGreaterAngliaFinalSubmitEnabled(),
+      finalSubmitEnabled,
     });
 
     if (executorResult.submitted) {
@@ -189,6 +195,9 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         source: executorResult.source || "greater_anglia_playwright_live_submission",
         submittedAt: executorResult.submittedAt || new Date().toISOString(),
         operatorReference: executorResult.operatorReference,
+        submissionStrategy: this.submissionStrategy,
+        playwrightExecutorEnabled,
+        finalSubmitEnabled,
         mappedSubmission,
         portalSubmissionPlan,
       };
@@ -204,6 +213,8 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         executorResult.integrationStatus ||
         getGreaterAngliaIntegrationStatus(),
       submissionStrategy: this.submissionStrategy,
+      playwrightExecutorEnabled,
+      finalSubmitEnabled,
       customer_status:
         executorResult.customer_status || "operator_submission_pending",
       customer_title:

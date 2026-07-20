@@ -585,6 +585,227 @@ function buildOperatorIntegrationPendingCopy({ submissionContext, detectedDelay 
 }
 
 
+
+function safeAuditText(value, fallback = null) {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+
+  const cleanValue = String(value).trim();
+  return cleanValue || fallback;
+}
+
+const SENSITIVE_AUDIT_FIELD_PATTERNS = [
+  "email",
+  "mobile",
+  "phone",
+  "telephone",
+  "fullName",
+  "firstName",
+  "lastName",
+  "forename",
+  "surname",
+  "address",
+  "postcode",
+  "postCode",
+  "postalCode",
+  "smartcardNumber",
+  "bookingReference",
+  "uniqueTicketReference",
+];
+
+function shouldRedactAuditField(key) {
+  const lowerKey = String(key || "").toLowerCase();
+
+  return SENSITIVE_AUDIT_FIELD_PATTERNS.some((fieldName) =>
+    lowerKey.includes(String(fieldName).toLowerCase())
+  );
+}
+
+function redactAuditObject(value, key = "") {
+  if (value === undefined || value === null) {
+    return value;
+  }
+
+  if (shouldRedactAuditField(key)) {
+    return "[redacted]";
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactAuditObject(item, key));
+  }
+
+  if (typeof value === "object") {
+    const redacted = {};
+
+    for (const [entryKey, entryValue] of Object.entries(value)) {
+      redacted[entryKey] = redactAuditObject(entryValue, entryKey);
+    }
+
+    return redacted;
+  }
+
+  return value;
+}
+
+function getSubmissionRunContext(submissionResult) {
+  return (
+    submissionResult?.runContext ||
+    submissionResult?.submission?.runContext ||
+    null
+  );
+}
+
+function buildOperatorSubmissionAuditPayload({
+  claim,
+  detectedDelay,
+  submissionContext,
+  submissionResult = null,
+  startedAt,
+  completedAt,
+  error = null,
+} = {}) {
+  const runContext = getSubmissionRunContext(submissionResult);
+  const screenshots = Array.isArray(runContext?.screenshots)
+    ? runContext.screenshots
+    : [];
+
+  const submitted = submissionResult?.submitted === true;
+  const blocked = error ? true : submissionResult?.blocked === true || !submitted;
+  const resultStatus = error
+    ? "error"
+    : submitted
+      ? "submitted"
+      : blocked
+        ? "blocked"
+        : "unknown";
+
+  const operatorKey =
+    safeAuditText(submissionResult?.operatorKey) ||
+    safeAuditText(submissionContext?.operator?.key) ||
+    "unknown_operator";
+
+  const operatorName =
+    safeAuditText(submissionResult?.operator) ||
+    safeAuditText(submissionContext?.operator?.displayName) ||
+    safeAuditText(detectedDelay?.operator) ||
+    "Unknown train operator";
+
+  const debugPayload = redactAuditObject({
+    reason: error?.message || submissionResult?.reason || null,
+    source: submissionResult?.source || null,
+    customerStatus: submissionResult?.customer_status || null,
+    missingAutomationInputs:
+      submissionResult?.missingAutomationInputs || null,
+    runContext,
+    mappedSubmission: submissionResult?.mappedSubmission || null,
+    portalSubmissionPlan: submissionResult?.portalSubmissionPlan || null,
+  });
+
+  return {
+    user_id: claim?.user_id || null,
+    claim_id: claim?.id || null,
+    detected_delay_id:
+      claim?.detected_delay_id || detectedDelay?.id || null,
+    operator_key: operatorKey,
+    operator_name: operatorName,
+    integration_method:
+      safeAuditText(submissionResult?.submissionStrategy) ||
+      safeAuditText(submissionResult?.mappedSubmission?.operator?.submissionMode) ||
+      safeAuditText(submissionResult?.portalSubmissionPlan?.portal?.submissionMethod) ||
+      null,
+    integration_status:
+      safeAuditText(submissionResult?.integrationStatus) || null,
+    submission_source:
+      safeAuditText(submissionResult?.source) ||
+      (error ? "operator_submission_exception" : null),
+    result_status: resultStatus,
+    blocked,
+    submitted,
+    final_submit_enabled:
+      submissionResult?.finalSubmitEnabled === true ||
+      runContext?.finalSubmitEnabled === true,
+    operator_reference:
+      safeAuditText(submissionResult?.operatorReference) || null,
+    reason: error?.message || submissionResult?.reason || null,
+    started_at: runContext?.startedAt || startedAt || new Date().toISOString(),
+    completed_at: runContext?.completedAt || completedAt || new Date().toISOString(),
+    screenshot_dir:
+      safeAuditText(runContext?.screenshotDir) ||
+      safeAuditText(process.env.GREATER_ANGLIA_SCREENSHOT_DIR) ||
+      null,
+    screenshots,
+    screenshot_count: screenshots.length,
+    debug_payload: debugPayload,
+  };
+}
+
+async function recordOperatorSubmissionAttempt({
+  claim,
+  detectedDelay,
+  submissionContext,
+  submissionResult = null,
+  startedAt,
+  completedAt,
+  error = null,
+} = {}) {
+  const auditPayload = buildOperatorSubmissionAuditPayload({
+    claim,
+    detectedDelay,
+    submissionContext,
+    submissionResult,
+    startedAt,
+    completedAt,
+    error,
+  });
+
+  try {
+    const { data, error: auditError } = await withTimeout(
+      supabaseAdmin
+        .from("operator_submission_attempts")
+        .insert([auditPayload])
+        .select("*")
+        .maybeSingle(),
+      10000,
+      "Operator submission audit insert"
+    );
+
+    if (auditError) {
+      throw auditError;
+    }
+
+    console.log("Operator submission audit recorded:", {
+      audit_id: data?.id,
+      claim_id: auditPayload.claim_id,
+      operator: auditPayload.operator_name,
+      result_status: auditPayload.result_status,
+      screenshot_count: auditPayload.screenshot_count,
+    });
+
+    return {
+      recorded: true,
+      audit_id: data?.id || null,
+      result_status: auditPayload.result_status,
+      screenshot_count: auditPayload.screenshot_count,
+      screenshots: auditPayload.screenshots,
+    };
+  } catch (auditError) {
+    console.error("Operator submission audit could not be recorded:", {
+      claim_id: auditPayload.claim_id,
+      error: auditError.message,
+    });
+
+    return {
+      recorded: false,
+      reason: "audit_insert_failed",
+      error: auditError.message,
+      result_status: auditPayload.result_status,
+      screenshot_count: auditPayload.screenshot_count,
+      screenshots: auditPayload.screenshots,
+    };
+  }
+}
+
 function getClaimOutcomeNotification(outcome) {
   if (outcome === "paid") {
     return {
@@ -1369,11 +1590,37 @@ if (!submissionValidation.readyForSubmission) {
     throw processingUpdateError;
   }
 
-  const submissionResult = await submitClaimThroughOperatorAdapter({
+  const operatorSubmissionStartedAt = new Date().toISOString();
+  let submissionResult = null;
+  let operatorSubmissionAudit = null;
+
+  try {
+    submissionResult = await submitClaimThroughOperatorAdapter({
+      claim,
+      detectedDelay,
+      submissionContext,
+    });
+  } catch (submissionError) {
+    operatorSubmissionAudit = await recordOperatorSubmissionAttempt({
+      claim,
+      detectedDelay,
+      submissionContext,
+      startedAt: operatorSubmissionStartedAt,
+      completedAt: new Date().toISOString(),
+      error: submissionError,
+    });
+
+    throw submissionError;
+  }
+
+  operatorSubmissionAudit = await recordOperatorSubmissionAttempt({
     claim,
     detectedDelay,
     submissionContext,
-   });
+    submissionResult,
+    startedAt: operatorSubmissionStartedAt,
+    completedAt: new Date().toISOString(),
+  });
 
   if (!submissionResult.submitted) {
     const { error: blockUpdateError } = await withTimeout(
@@ -1409,9 +1656,11 @@ if (!submissionValidation.readyForSubmission) {
       customer_title: operatorPendingCopy.customer_title,
       customer_next_step: operatorPendingCopy.customer_next_step,
       customer_status: operatorPendingCopy.customer_status,
+      operator_submission_audit: operatorSubmissionAudit,
       submission: {
         ...submissionResult,
         ...operatorPendingCopy,
+        operator_submission_audit: operatorSubmissionAudit,
       },
     };
   }
@@ -1452,6 +1701,7 @@ if (!submissionValidation.readyForSubmission) {
     message: "Claim submitted automatically.",
     claim: submittedClaim,
     submission: submissionResult,
+    operator_submission_audit: operatorSubmissionAudit,
     next_job: outcomeJob,
   };
 }
