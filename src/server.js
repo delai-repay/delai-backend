@@ -2978,6 +2978,41 @@ async function getNextPendingDelayCandidate({
   return data?.[0] || null;
 }
 
+
+async function findConfirmedDelayForGroup({
+  userId,
+  commuteId,
+  serviceDate,
+  direction,
+  excludeId = null,
+}) {
+  let queryBuilder = supabaseAdmin
+    .from("detected_delays")
+    .select("id, scheduled_departure_time, delay_minutes, passenger_confirmation_status")
+    .eq("user_id", userId)
+    .eq("commute_id", commuteId)
+    .eq("service_date", serviceDate)
+    .eq("direction", direction)
+    .eq("passenger_confirmation_status", "confirmed")
+    .limit(1);
+
+  if (excludeId) {
+    queryBuilder = queryBuilder.neq("id", excludeId);
+  }
+
+  const { data, error } = await withTimeout(
+    queryBuilder,
+    10000,
+    "Confirmed delayed service group lookup"
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return data?.[0] || null;
+}
+
 async function notifyNextDelayCandidateForGroup({
   userId,
   commuteId,
@@ -3120,6 +3155,28 @@ app.post("/detect-delays", async (req, res) => {
 
       for (const directionConfig of directions) {
         const { direction, travelWindow } = directionConfig;
+
+        const alreadyConfirmedService = await findConfirmedDelayForGroup({
+          userId: commute.user_id,
+          commuteId: commute.id,
+          serviceDate: todayDate,
+          direction,
+        });
+
+        if (alreadyConfirmedService) {
+          console.log(
+            "Skipping delay candidates because this commute window already has a confirmed service:",
+            {
+              commute_id: commute.id,
+              service_date: todayDate,
+              direction,
+              confirmed_delay_id: alreadyConfirmedService.id,
+              confirmed_scheduled_departure_time:
+                alreadyConfirmedService.scheduled_departure_time,
+            }
+          );
+          continue;
+        }
 
         const matchedServices = exactServices.filter((service) =>
           serviceMatchesCommuteDirection({
@@ -3385,6 +3442,31 @@ app.get("/pending-delay-confirmations", async (req, res) => {
       throw error;
     }
 
+    const { data: confirmedGroups, error: confirmedGroupsError } =
+      await withTimeout(
+        supabaseAdmin
+          .from("detected_delays")
+          .select("commute_id, service_date, direction")
+          .eq("user_id", userId)
+          .eq("passenger_confirmation_status", "confirmed"),
+        10000,
+        "Confirmed delay groups lookup"
+      );
+
+    if (confirmedGroupsError) {
+      throw confirmedGroupsError;
+    }
+
+    const confirmedGroupKeys = new Set(
+      (confirmedGroups || []).map((candidate) =>
+        [
+          candidate.commute_id,
+          candidate.service_date,
+          candidate.direction,
+        ].join("|")
+      )
+    );
+
     const primaryByGroup = new Map();
 
     for (const candidate of data || []) {
@@ -3393,6 +3475,12 @@ app.get("/pending-delay-confirmations", async (req, res) => {
         candidate.service_date,
         candidate.direction,
       ].join("|");
+
+      // Step 19N2.2: once one exact service is confirmed for a commute
+      // window, any later/stale sibling candidate is no longer actionable.
+      if (confirmedGroupKeys.has(groupKey)) {
+        continue;
+      }
 
       if (!primaryByGroup.has(groupKey)) {
         primaryByGroup.set(groupKey, candidate);
@@ -3489,32 +3577,53 @@ app.post("/respond-delay-confirmation", async (req, res) => {
         // prevents two confirmed services for the same commute window.
       }
 
-      const { data: competingConfirmed, error: competingError } =
-        await withTimeout(
-          supabaseAdmin
-            .from("detected_delays")
-            .select("id, scheduled_departure_time, delay_minutes")
-            .eq("user_id", userId)
-            .eq("commute_id", detectedDelay.commute_id)
-            .eq("service_date", detectedDelay.service_date)
-            .eq("direction", detectedDelay.direction)
-            .eq("passenger_confirmation_status", "confirmed")
-            .neq("id", detectedDelay.id)
-            .limit(1),
-          10000,
-          "Competing confirmed delayed service lookup"
-        );
+      const competingConfirmed = await findConfirmedDelayForGroup({
+        userId,
+        commuteId: detectedDelay.commute_id,
+        serviceDate: detectedDelay.service_date,
+        direction: detectedDelay.direction,
+        excludeId: detectedDelay.id,
+      });
 
-      if (competingError) {
-        throw competingError;
-      }
+      if (competingConfirmed) {
+        const now = new Date().toISOString();
 
-      if (competingConfirmed?.length) {
-        return res.status(409).json({
-          success: false,
-          error:
-            "Another service in this commute window has already been confirmed.",
-          confirmed_service: competingConfirmed[0],
+        const { data: closedCandidate, error: closeCandidateError } =
+          await withTimeout(
+            supabaseAdmin
+              .from("detected_delays")
+              .update({
+                passenger_confirmation_status: "not_applicable",
+                status: "not_selected",
+                updated_at: now,
+              })
+              .eq("id", detectedDelay.id)
+              .eq("user_id", userId)
+              .select("*")
+              .single(),
+            10000,
+            "Close stale competing delay confirmation candidate"
+          );
+
+        if (closeCandidateError) {
+          throw closeCandidateError;
+        }
+
+        const resolvedNotifications =
+          await resolveDelayConfirmationNotification({
+            userId,
+            detectedDelayId,
+            actionStatus: "not_applicable",
+          });
+
+        return res.json({
+          success: true,
+          response: "not_applicable",
+          message:
+            "Another service in this commute window was already confirmed, so this candidate has been closed.",
+          detected_delay: closedCandidate,
+          confirmed_service: competingConfirmed,
+          resolved_notifications: resolvedNotifications,
         });
       }
 
