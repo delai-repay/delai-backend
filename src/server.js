@@ -3468,6 +3468,7 @@ app.get("/pending-delay-confirmations", async (req, res) => {
     );
 
     const primaryByGroup = new Map();
+    const staleCandidatesToClose = [];
 
     for (const candidate of data || []) {
       const groupKey = [
@@ -3476,15 +3477,47 @@ app.get("/pending-delay-confirmations", async (req, res) => {
         candidate.direction,
       ].join("|");
 
-      // Step 19N2.2: once one exact service is confirmed for a commute
-      // window, any later/stale sibling candidate is no longer actionable.
+      // Step 19N2.3: once one exact service is confirmed for a commute
+      // window, a stale sibling must be CLOSED, not merely hidden. Otherwise
+      // the dashboard bell can still show its unread action notification while
+      // the Notification Centre has no actionable candidate to display.
       if (confirmedGroupKeys.has(groupKey)) {
+        staleCandidatesToClose.push(candidate);
         continue;
       }
 
       if (!primaryByGroup.has(groupKey)) {
         primaryByGroup.set(groupKey, candidate);
       }
+    }
+
+    for (const staleCandidate of staleCandidatesToClose) {
+      const now = new Date().toISOString();
+
+      const { error: staleUpdateError } = await withTimeout(
+        supabaseAdmin
+          .from("detected_delays")
+          .update({
+            passenger_confirmation_status: "not_applicable",
+            status: "not_selected",
+            updated_at: now,
+          })
+          .eq("id", staleCandidate.id)
+          .eq("user_id", userId)
+          .eq("passenger_confirmation_status", "pending"),
+        10000,
+        "Close stale pending delay candidate"
+      );
+
+      if (staleUpdateError) {
+        throw staleUpdateError;
+      }
+
+      await resolveDelayConfirmationNotification({
+        userId,
+        detectedDelayId: staleCandidate.id,
+        actionStatus: "not_applicable",
+      });
     }
 
     const confirmations = Array.from(primaryByGroup.values()).map(
