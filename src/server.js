@@ -1139,7 +1139,7 @@ Commute details:
 - Travel days: ${travelDays}
 
 Passenger confirmation:
-- The passenger previously confirmed this commute and ticket information.
+- The passenger confirmed they travelled on this exact delayed service before Delai started claim automation.
 
 Suggested claim wording:
 ${operatorGuidance.suggestedWording}
@@ -1333,6 +1333,26 @@ async function submitClaimThroughOperatorAdapter({
 }
 
 async function ensureClaimForDetectedDelay(detectedDelay) {
+  if (!detectedDelay?.id || !detectedDelay?.user_id) {
+    throw new Error("A valid detected delay is required before a claim can be created.");
+  }
+
+  if (detectedDelay.passenger_confirmation_status !== "confirmed") {
+    throw new Error(
+      "Passenger confirmation is required before Delai can create a claim for this delayed service."
+    );
+  }
+
+  const exactScheduledTime = normaliseExactServiceTime(
+    detectedDelay.scheduled_departure_time || detectedDelay.scheduled_time
+  );
+
+  if (!exactScheduledTime) {
+    throw new Error(
+      "An exact scheduled departure time is required before Delai can create a claim."
+    );
+  }
+
   const { data: existingClaim, error: existingError } = await withTimeout(
     supabaseAdmin
       .from("claims")
@@ -1521,6 +1541,23 @@ async function processClaimSubmitJob(job) {
   if (!detectedDelay) {
     throw new Error("Linked detected delay not found for submission.");
   }
+
+  if (detectedDelay.passenger_confirmation_status !== "confirmed") {
+    throw new Error(
+      "Passenger confirmation is required before Delai can submit this claim."
+    );
+  }
+
+  if (
+    !normaliseExactServiceTime(
+      detectedDelay.scheduled_departure_time || detectedDelay.scheduled_time
+    )
+  ) {
+    throw new Error(
+      "An exact scheduled departure time is required before Delai can submit this claim."
+    );
+  }
+
   const submissionContext =
   await loadClaimSubmissionContext({
     claim,
@@ -2429,6 +2466,581 @@ app.get("/detect-delays-test", async (req, res) => {
   }
 });
 
+
+function normaliseExactServiceTime(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const cleanValue = String(value).trim();
+  const match = cleanValue.match(/^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
+
+  return match ? `${match[1]}:${match[2]}` : null;
+}
+
+function normaliseServiceDate(value, fallbackDate = null) {
+  if (!value) {
+    return fallbackDate;
+  }
+
+  const cleanValue = String(value).trim();
+  const isoMatch = cleanValue.match(/^(\d{4})-(\d{2})-(\d{2})/);
+
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+
+  const parsed = new Date(cleanValue);
+
+  if (Number.isNaN(parsed.getTime())) {
+    return fallbackDate;
+  }
+
+  return parsed.toISOString().split("T")[0];
+}
+
+function timeToMinutes(value) {
+  const cleanValue = normaliseExactServiceTime(value);
+
+  if (!cleanValue) {
+    return null;
+  }
+
+  const [hours, minutes] = cleanValue.split(":").map(Number);
+  return hours * 60 + minutes;
+}
+
+function parseCommuteWindow(value) {
+  const cleanValue = String(value || "").trim();
+  const match = cleanValue.match(
+    /^([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)$/
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    start: `${match[1]}:${match[2]}`,
+    end: `${match[3]}:${match[4]}`,
+    startMinutes: Number(match[1]) * 60 + Number(match[2]),
+    endMinutes: Number(match[3]) * 60 + Number(match[4]),
+  };
+}
+
+function isTimeInsideCommuteWindow(time, windowValue) {
+  const serviceMinutes = timeToMinutes(time);
+  const window = parseCommuteWindow(windowValue);
+
+  if (serviceMinutes === null || !window) {
+    return false;
+  }
+
+  if (window.endMinutes >= window.startMinutes) {
+    return (
+      serviceMinutes >= window.startMinutes &&
+      serviceMinutes <= window.endMinutes
+    );
+  }
+
+  return (
+    serviceMinutes >= window.startMinutes ||
+    serviceMinutes <= window.endMinutes
+  );
+}
+
+function normaliseRouteText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function routeTextMatches(left, right) {
+  const cleanLeft = normaliseRouteText(left);
+  const cleanRight = normaliseRouteText(right);
+
+  if (!cleanLeft || !cleanRight) {
+    return false;
+  }
+
+  return (
+    cleanLeft === cleanRight ||
+    cleanLeft.includes(cleanRight) ||
+    cleanRight.includes(cleanLeft)
+  );
+}
+
+function calculateDelayMinutesFromTimes({
+  scheduledArrivalTime,
+  actualArrivalTime,
+  scheduledDepartureTime,
+  actualDepartureTime,
+}) {
+  const scheduledArrivalMinutes = timeToMinutes(scheduledArrivalTime);
+  const actualArrivalMinutes = timeToMinutes(actualArrivalTime);
+
+  if (scheduledArrivalMinutes !== null && actualArrivalMinutes !== null) {
+    let difference = actualArrivalMinutes - scheduledArrivalMinutes;
+
+    if (difference < -720) {
+      difference += 24 * 60;
+    }
+
+    return Math.max(0, difference);
+  }
+
+  const scheduledDepartureMinutes = timeToMinutes(scheduledDepartureTime);
+  const actualDepartureMinutes = timeToMinutes(actualDepartureTime);
+
+  if (scheduledDepartureMinutes !== null && actualDepartureMinutes !== null) {
+    let difference = actualDepartureMinutes - scheduledDepartureMinutes;
+
+    if (difference < -720) {
+      difference += 24 * 60;
+    }
+
+    return Math.max(0, difference);
+  }
+
+  return null;
+}
+
+function getDelayRepayThresholdMinutes(operatorName) {
+  const operator = String(operatorName || "").toLowerCase();
+
+  if (
+    operator.includes("greater anglia") ||
+    operator.includes("c2c") ||
+    operator.includes("southern") ||
+    operator.includes("thameslink") ||
+    operator.includes("great northern") ||
+    operator.includes("gatwick express") ||
+    operator.includes("southeastern")
+  ) {
+    return 15;
+  }
+
+  return 15;
+}
+
+function normaliseExactServiceCandidate(service = {}, fallbackDate = null) {
+  const scheduledDepartureTime = normaliseExactServiceTime(
+    service.scheduled_departure_time ??
+      service.scheduledDepartureTime ??
+      service.scheduled_time ??
+      service.scheduledTime
+  );
+
+  const scheduledArrivalTime = normaliseExactServiceTime(
+    service.scheduled_arrival_time ?? service.scheduledArrivalTime
+  );
+
+  const actualDepartureTime = normaliseExactServiceTime(
+    service.actual_departure_time ?? service.actualDepartureTime
+  );
+
+  const actualArrivalTime = normaliseExactServiceTime(
+    service.actual_arrival_time ?? service.actualArrivalTime
+  );
+
+  const suppliedDelay = Number(service.delay_minutes ?? service.delayMinutes);
+  const calculatedDelay = calculateDelayMinutesFromTimes({
+    scheduledArrivalTime,
+    actualArrivalTime,
+    scheduledDepartureTime,
+    actualDepartureTime,
+  });
+
+  const delayMinutes = Number.isFinite(suppliedDelay)
+    ? Math.max(0, suppliedDelay)
+    : calculatedDelay;
+
+  return {
+    serviceIdentifier:
+      String(
+        service.service_identifier ??
+          service.serviceIdentifier ??
+          service.service_id ??
+          service.serviceId ??
+          ""
+      ).trim() || null,
+    serviceDate: normaliseServiceDate(
+      service.service_date ??
+        service.serviceDate ??
+        service.delay_date ??
+        service.date,
+      fallbackDate
+    ),
+    operator:
+      String(service.operator ?? service.operator_name ?? "").trim() || null,
+    originStation:
+      String(
+        service.origin_station ??
+          service.originStation ??
+          service.from_station ??
+          service.fromStation ??
+          ""
+      ).trim() || null,
+    destinationStation:
+      String(
+        service.destination_station ??
+          service.destinationStation ??
+          service.to_station ??
+          service.toStation ??
+          ""
+      ).trim() || null,
+    scheduledDepartureTime,
+    scheduledArrivalTime,
+    actualDepartureTime,
+    actualArrivalTime,
+    delayMinutes:
+      delayMinutes === null || Number.isNaN(delayMinutes)
+        ? null
+        : Math.round(delayMinutes),
+    source:
+      String(service.source || "exact_service_feed").trim() ||
+      "exact_service_feed",
+  };
+}
+
+function serviceMatchesCommuteDirection({
+  service,
+  commute,
+  direction,
+  travelWindow,
+  serviceDate,
+}) {
+  if (!service?.scheduledDepartureTime) {
+    return false;
+  }
+
+  if (service.serviceDate !== serviceDate) {
+    return false;
+  }
+
+  if (!isTimeInsideCommuteWindow(service.scheduledDepartureTime, travelWindow)) {
+    return false;
+  }
+
+  const expectedOrigin =
+    direction === "return" ? commute.destination_station : commute.origin_station;
+  const expectedDestination =
+    direction === "return" ? commute.origin_station : commute.destination_station;
+
+  if (!routeTextMatches(service.originStation, expectedOrigin)) {
+    return false;
+  }
+
+  if (!routeTextMatches(service.destinationStation, expectedDestination)) {
+    return false;
+  }
+
+  if (
+    service.operator &&
+    commute.operator &&
+    !routeTextMatches(service.operator, commute.operator)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+async function findExistingExactDetectedDelay({ commute, service, direction }) {
+  let existingQuery = supabaseAdmin
+    .from("detected_delays")
+    .select("id, passenger_confirmation_status, candidate_rank")
+    .eq("user_id", commute.user_id)
+    .eq("commute_id", commute.id)
+    .eq("service_date", service.serviceDate)
+    .eq("direction", direction);
+
+  if (service.serviceIdentifier) {
+    existingQuery = existingQuery.eq(
+      "service_identifier",
+      service.serviceIdentifier
+    );
+  } else {
+    existingQuery = existingQuery.eq(
+      "scheduled_departure_time",
+      service.scheduledDepartureTime
+    );
+  }
+
+  const { data, error } = await withTimeout(
+    existingQuery.limit(1),
+    10000,
+    "Existing exact delayed service lookup"
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return data?.[0] || null;
+}
+
+
+function buildDelayConfirmationCopy(detectedDelay) {
+  const scheduledTime = normaliseExactServiceTime(
+    detectedDelay?.scheduled_departure_time || detectedDelay?.scheduled_time
+  );
+
+  const route =
+    detectedDelay?.origin_station && detectedDelay?.destination_station
+      ? `${detectedDelay.origin_station} → ${detectedDelay.destination_station}`
+      : "your saved journey";
+
+  const delayMinutes = Number(detectedDelay?.delay_minutes || 0);
+
+  if (!scheduledTime) {
+    return {
+      type: "delay_confirmation_required",
+      title: "Were you on this delayed train?",
+      message: `Your ${route} service was delayed by ${delayMinutes} minute${delayMinutes === 1 ? "" : "s"}. Were you on this train?`,
+    };
+  }
+
+  return {
+    type: "delay_confirmation_required",
+    title: `Were you on the ${scheduledTime} train?`,
+    message: `Your ${scheduledTime} ${route} service was delayed by ${delayMinutes} minute${delayMinutes === 1 ? "" : "s"}. Were you on this train?`,
+  };
+}
+
+async function findExistingDelayConfirmationNotification({
+  userId,
+  detectedDelayId,
+}) {
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("notifications")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("detected_delay_id", detectedDelayId)
+      .eq("type", "delay_confirmation_required")
+      .order("created_at", { ascending: false })
+      .limit(1),
+    10000,
+    "Existing delay confirmation notification lookup"
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return data?.[0] || null;
+}
+
+async function createDelayConfirmationNotification(detectedDelay) {
+  if (!detectedDelay?.id || !detectedDelay?.user_id) {
+    throw new Error("Detected delay is required to create a confirmation notification.");
+  }
+
+  if (detectedDelay.passenger_confirmation_status !== "pending") {
+    return {
+      skipped: true,
+      reason: "candidate_not_pending",
+      detected_delay: detectedDelay,
+    };
+  }
+
+  const existingNotification = await findExistingDelayConfirmationNotification({
+    userId: detectedDelay.user_id,
+    detectedDelayId: detectedDelay.id,
+  });
+
+  if (existingNotification) {
+    return {
+      skipped: true,
+      reason: "duplicate_notification",
+      notification: existingNotification,
+    };
+  }
+
+  const copy = buildDelayConfirmationCopy(detectedDelay);
+  const now = new Date().toISOString();
+
+  const { data: notification, error: notificationError } = await withTimeout(
+    supabaseAdmin
+      .from("notifications")
+      .insert([
+        {
+          user_id: detectedDelay.user_id,
+          claim_id: null,
+          detected_delay_id: detectedDelay.id,
+          type: copy.type,
+          title: copy.title,
+          message: copy.message,
+          read: false,
+          action_required: true,
+          action_type: "confirm_delayed_service",
+          action_status: "pending",
+        },
+      ])
+      .select("*")
+      .single(),
+    10000,
+    "Create delay confirmation notification"
+  );
+
+  if (notificationError) {
+    throw notificationError;
+  }
+
+  const { error: delayUpdateError } = await withTimeout(
+    supabaseAdmin
+      .from("detected_delays")
+      .update({
+        confirmation_notified_at: now,
+        updated_at: now,
+      })
+      .eq("id", detectedDelay.id)
+      .eq("user_id", detectedDelay.user_id),
+    10000,
+    "Mark delayed service confirmation notified"
+  );
+
+  if (delayUpdateError) {
+    throw delayUpdateError;
+  }
+
+  return {
+    skipped: false,
+    notification,
+  };
+}
+
+async function resolveDelayConfirmationNotification({
+  userId,
+  detectedDelayId,
+  actionStatus,
+}) {
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("notifications")
+      .update({
+        read: true,
+        action_required: false,
+        action_status: actionStatus,
+        resolved_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
+      .eq("detected_delay_id", detectedDelayId)
+      .eq("type", "delay_confirmation_required")
+      .select("*"),
+    10000,
+    "Resolve delay confirmation notification"
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return data || [];
+}
+
+async function getNextPendingDelayCandidate({
+  userId,
+  commuteId,
+  serviceDate,
+  direction,
+  afterRank = 0,
+}) {
+  let queryBuilder = supabaseAdmin
+    .from("detected_delays")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("commute_id", commuteId)
+    .eq("service_date", serviceDate)
+    .eq("direction", direction)
+    .eq("passenger_confirmation_status", "pending")
+    .order("candidate_rank", { ascending: true })
+    .order("scheduled_departure_time", { ascending: true })
+    .limit(1);
+
+  if (Number(afterRank) > 0) {
+    queryBuilder = queryBuilder.gt("candidate_rank", Number(afterRank));
+  }
+
+  const { data, error } = await withTimeout(
+    queryBuilder,
+    10000,
+    "Next pending delay confirmation candidate lookup"
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return data?.[0] || null;
+}
+
+async function notifyNextDelayCandidateForGroup({
+  userId,
+  commuteId,
+  serviceDate,
+  direction,
+  afterRank = 0,
+}) {
+  const nextCandidate = await getNextPendingDelayCandidate({
+    userId,
+    commuteId,
+    serviceDate,
+    direction,
+    afterRank,
+  });
+
+  if (!nextCandidate) {
+    return {
+      skipped: true,
+      reason: "no_pending_candidate",
+      candidate: null,
+      notification: null,
+    };
+  }
+
+  const notificationResult = await createDelayConfirmationNotification(
+    nextCandidate
+  );
+
+  return {
+    skipped: notificationResult.skipped === true,
+    reason: notificationResult.reason || null,
+    candidate: nextCandidate,
+    notification: notificationResult.notification || null,
+  };
+}
+
+async function closeSiblingCandidatesAfterConfirmation(detectedDelay) {
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("detected_delays")
+      .update({
+        passenger_confirmation_status: "not_applicable",
+        status: "not_selected",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", detectedDelay.user_id)
+      .eq("commute_id", detectedDelay.commute_id)
+      .eq("service_date", detectedDelay.service_date)
+      .eq("direction", detectedDelay.direction)
+      .eq("passenger_confirmation_status", "pending")
+      .neq("id", detectedDelay.id)
+      .select("id, candidate_rank, scheduled_departure_time"),
+    10000,
+    "Close sibling delayed service candidates"
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return data || [];
+}
+
 app.post("/detect-delays", async (req, res) => {
   try {
     const { data: commutes, error: commuteError } = await withTimeout(
@@ -2446,6 +3058,7 @@ app.post("/detect-delays", async (req, res) => {
         ok: true,
         message: "No commutes found to check.",
         checked_commutes: 0,
+        supplied_service_count: 0,
         created_count: 0,
         created_delays: [],
       });
@@ -2453,108 +3066,586 @@ app.post("/detect-delays", async (req, res) => {
 
     const today = new Date();
     const todayDate = today.toISOString().split("T")[0];
-    const todayDay = today.toLocaleDateString("en-GB", {
-      weekday: "long",
-    });
-
-    const createdDelays = [];
-
-    for (const commute of commutes) {
-    const travelDays = Array.isArray(commute.travel_days)
-    ? commute.travel_days
-    : [];
-
+    const todayDay = today.toLocaleDateString("en-GB", { weekday: "long" });
     const forceDetection = req.body?.force === true;
 
-     if (!forceDetection && !travelDays.includes(todayDay)) {
-    continue;
-    }
+    const suppliedServices = Array.isArray(req.body?.services)
+      ? req.body.services
+      : [];
 
-      const testDelay = {
-        user_id: commute.user_id,
-        commute_id: commute.id,
-        operator: commute.operator,
-        origin_station: commute.origin_station,
-        destination_station: commute.destination_station,
-        travel_window: commute.outbound_time,
-        direction: "outbound",
-        delay_date: todayDate,
-        scheduled_time: commute.outbound_time,
-        actual_time: "Test delay",
-        delay_minutes: 18,
-        status: "detected",
-        source: "manual_test_endpoint",
-        updated_at: new Date().toISOString(),
-      };
-
-      const { data: existingDelay, error: existingError } = await withTimeout(
-        supabaseAdmin
-          .from("detected_delays")
-          .select("id")
-          .eq("user_id", commute.user_id)
-          .eq("commute_id", commute.id)
-          .eq("delay_date", todayDate)
-          .eq("direction", "outbound")
-          .maybeSingle(),
-        10000,
-        "Existing delay lookup"
+    const exactServices = suppliedServices
+      .map((service) => normaliseExactServiceCandidate(service, todayDate))
+      .filter(
+        (service) =>
+          service.serviceDate &&
+          service.originStation &&
+          service.destinationStation &&
+          service.scheduledDepartureTime &&
+          service.delayMinutes !== null
       );
 
-      if (existingError) {
-        throw existingError;
-      }
+    if (exactServices.length === 0) {
+      return res.json({
+        ok: true,
+        message:
+          "No exact train services were supplied, so Delai did not fabricate a delay from the commute window.",
+        provider_status: "exact_service_feed_required",
+        checked_commutes: commutes.length,
+        supplied_service_count: suppliedServices.length,
+        valid_exact_service_count: 0,
+        created_count: 0,
+        created_delays: [],
+      });
+    }
 
-      if (existingDelay) {
+    const createdDelays = [];
+    const confirmationCandidates = [];
+    let matchedServiceCount = 0;
+    let qualifyingServiceCount = 0;
+    let skippedExistingCount = 0;
+
+    for (const commute of commutes) {
+      const travelDays = Array.isArray(commute.travel_days)
+        ? commute.travel_days
+        : [];
+
+      if (!forceDetection && !travelDays.includes(todayDay)) {
         continue;
       }
 
-      const { data: insertedDelay, error: insertError } = await withTimeout(
-        supabaseAdmin
-          .from("detected_delays")
-          .insert(testDelay)
-          .select("*")
-          .single(),
-        10000,
-        "Detected delay insert"
-      );
+      const directions = [
+        { direction: "outbound", travelWindow: commute.outbound_time },
+        { direction: "return", travelWindow: commute.return_time },
+      ].filter((entry) => parseCommuteWindow(entry.travelWindow));
 
-      if (insertError) {
-        throw insertError;
-      }
+      for (const directionConfig of directions) {
+        const { direction, travelWindow } = directionConfig;
 
-      try {
-        const claimAutomation = await ensureClaimForDetectedDelay(insertedDelay);
-
-        console.log("Automatic claim pipeline started:", {
-          delay_id: insertedDelay.id,
-          claim_id: claimAutomation.claim?.id,
-          job_type: claimAutomation.automationJob?.job?.job_type,
-        });
-      } catch (automationError) {
-        console.error(
-          "Delay created, but automatic claim pipeline could not start:",
-          {
-            delay_id: insertedDelay.id,
-            error: automationError.message,
-          }
+        const matchedServices = exactServices.filter((service) =>
+          serviceMatchesCommuteDirection({
+            service,
+            commute,
+            direction,
+            travelWindow,
+            serviceDate: todayDate,
+          })
         );
+
+        matchedServiceCount += matchedServices.length;
+
+        const thresholdMinutes = getDelayRepayThresholdMinutes(commute.operator);
+
+        const qualifyingServices = matchedServices
+          .filter((service) => Number(service.delayMinutes) >= thresholdMinutes)
+          .sort((left, right) => {
+            const delayDifference =
+              Number(right.delayMinutes) - Number(left.delayMinutes);
+
+            if (delayDifference !== 0) {
+              return delayDifference;
+            }
+
+            return String(left.scheduledDepartureTime).localeCompare(
+              String(right.scheduledDepartureTime)
+            );
+          });
+
+        qualifyingServiceCount += qualifyingServices.length;
+
+        for (
+          let candidateIndex = 0;
+          candidateIndex < qualifyingServices.length;
+          candidateIndex += 1
+        ) {
+          const service = qualifyingServices[candidateIndex];
+          const candidateRank = candidateIndex + 1;
+
+          const existingDelay = await findExistingExactDetectedDelay({
+            commute,
+            service,
+            direction,
+          });
+
+          if (existingDelay) {
+            skippedExistingCount += 1;
+            confirmationCandidates.push({
+              detected_delay_id: existingDelay.id,
+              user_id: commute.user_id,
+              commute_id: commute.id,
+              service_date: service.serviceDate,
+              direction,
+              candidate_rank: existingDelay.candidate_rank || candidateRank,
+              scheduled_departure_time: service.scheduledDepartureTime,
+              delay_minutes: service.delayMinutes,
+              passenger_confirmation_status:
+                existingDelay.passenger_confirmation_status || "pending",
+              existing: true,
+            });
+            continue;
+          }
+
+          const detectedDelayPayload = {
+            user_id: commute.user_id,
+            commute_id: commute.id,
+            operator: service.operator || commute.operator,
+            origin_station: service.originStation,
+            destination_station: service.destinationStation,
+            travel_window: travelWindow,
+            direction,
+            delay_date: service.serviceDate,
+            service_date: service.serviceDate,
+            service_identifier: service.serviceIdentifier,
+            scheduled_departure_time: service.scheduledDepartureTime,
+            scheduled_arrival_time: service.scheduledArrivalTime,
+            actual_departure_time: service.actualDepartureTime,
+            actual_arrival_time: service.actualArrivalTime,
+            scheduled_time: service.scheduledDepartureTime,
+            actual_time:
+              service.actualArrivalTime || service.actualDepartureTime || null,
+            delay_minutes: service.delayMinutes,
+            candidate_rank: candidateRank,
+            status: "awaiting_confirmation",
+            passenger_confirmation_status: "pending",
+            passenger_confirmed_at: null,
+            passenger_rejected_at: null,
+            confirmation_notified_at: null,
+            source: service.source,
+            updated_at: new Date().toISOString(),
+          };
+
+          const { data: insertedDelay, error: insertError } = await withTimeout(
+            supabaseAdmin
+              .from("detected_delays")
+              .insert(detectedDelayPayload)
+              .select("*")
+              .single(),
+            10000,
+            "Exact detected service insert"
+          );
+
+          if (insertError) {
+            throw insertError;
+          }
+
+          createdDelays.push(insertedDelay);
+          confirmationCandidates.push({
+            detected_delay_id: insertedDelay.id,
+            user_id: commute.user_id,
+            commute_id: commute.id,
+            direction,
+            candidate_rank: candidateRank,
+            service_identifier: service.serviceIdentifier,
+            service_date: service.serviceDate,
+            origin_station: service.originStation,
+            destination_station: service.destinationStation,
+            scheduled_departure_time: service.scheduledDepartureTime,
+            scheduled_arrival_time: service.scheduledArrivalTime,
+            actual_departure_time: service.actualDepartureTime,
+            actual_arrival_time: service.actualArrivalTime,
+            delay_minutes: service.delayMinutes,
+            passenger_confirmation_status: "pending",
+            existing: false,
+          });
+
+          console.log(
+            "Exact delayed service stored awaiting passenger confirmation:",
+            {
+              delay_id: insertedDelay.id,
+              commute_id: commute.id,
+              direction,
+              candidate_rank: candidateRank,
+              scheduled_departure_time: service.scheduledDepartureTime,
+              delay_minutes: service.delayMinutes,
+            }
+          );
+        }
+      }
+    }
+
+    confirmationCandidates.sort((left, right) => {
+      if (left.commute_id !== right.commute_id) {
+        return String(left.commute_id).localeCompare(String(right.commute_id));
       }
 
-      createdDelays.push(insertedDelay);
+      if (left.direction !== right.direction) {
+        return String(left.direction).localeCompare(String(right.direction));
+      }
+
+      return (
+        Number(left.candidate_rank || 999) -
+        Number(right.candidate_rank || 999)
+      );
+    });
+
+    const notificationGroups = new Map();
+
+    for (const candidate of confirmationCandidates) {
+      if (candidate.passenger_confirmation_status !== "pending") {
+        continue;
+      }
+
+      const groupKey = [
+        candidate.user_id,
+        candidate.commute_id,
+        candidate.service_date,
+        candidate.direction,
+      ].join("|");
+
+      if (!notificationGroups.has(groupKey)) {
+        notificationGroups.set(groupKey, candidate);
+      }
+    }
+
+    const confirmationNotifications = [];
+
+    for (const candidate of notificationGroups.values()) {
+      const notificationResult = await notifyNextDelayCandidateForGroup({
+        userId: candidate.user_id,
+        commuteId: candidate.commute_id,
+        serviceDate: candidate.service_date,
+        direction: candidate.direction,
+        afterRank: 0,
+      });
+
+      confirmationNotifications.push({
+        commute_id: candidate.commute_id,
+        service_date: candidate.service_date,
+        direction: candidate.direction,
+        detected_delay_id: notificationResult.candidate?.id || null,
+        candidate_rank: notificationResult.candidate?.candidate_rank || null,
+        scheduled_departure_time:
+          notificationResult.candidate?.scheduled_departure_time || null,
+        delay_minutes: notificationResult.candidate?.delay_minutes || null,
+        notification_created:
+          Boolean(notificationResult.notification) && !notificationResult.skipped,
+        skipped: notificationResult.skipped,
+        reason: notificationResult.reason || null,
+      });
     }
 
     res.json({
       ok: true,
-      message: "Delay detection completed.",
+      message:
+        "Exact-service delay detection completed. Qualifying delayed services are awaiting passenger confirmation.",
+      provider_status: "exact_service_model_active",
       checked_commutes: commutes.length,
+      supplied_service_count: suppliedServices.length,
+      valid_exact_service_count: exactServices.length,
+      matched_service_count: matchedServiceCount,
+      qualifying_service_count: qualifyingServiceCount,
       created_count: createdDelays.length,
+      skipped_existing_count: skippedExistingCount,
       created_delays: createdDelays,
+      confirmation_candidates: confirmationCandidates,
+      confirmation_notifications: confirmationNotifications,
+      next_step:
+        "Candidate rank 1 has been placed in the passenger confirmation queue. A claim is only created after a Yes response.",
     });
   } catch (error) {
     console.error("Delay detection failed:", error);
 
     res.status(500).json({
       ok: false,
+      error: error.message,
+    });
+  }
+});
+
+
+app.get("/pending-delay-confirmations", async (req, res) => {
+  try {
+    const userId = String(req.query?.user_id || "").trim();
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing user_id",
+      });
+    }
+
+    const { data, error } = await withTimeout(
+      supabaseAdmin
+        .from("detected_delays")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("passenger_confirmation_status", "pending")
+        // Step 19N1: only the exact-service rows created by Step 19M are
+        // actionable. Older test rows have no exact departure time/rank and
+        // must never appear as passenger confirmation prompts.
+        .not("scheduled_departure_time", "is", null)
+        .not("candidate_rank", "is", null)
+        .order("service_date", { ascending: false })
+        .order("candidate_rank", { ascending: true })
+        .order("scheduled_departure_time", { ascending: true }),
+      10000,
+      "Pending delay confirmations lookup"
+    );
+
+    if (error) {
+      throw error;
+    }
+
+    const primaryByGroup = new Map();
+
+    for (const candidate of data || []) {
+      const groupKey = [
+        candidate.commute_id,
+        candidate.service_date,
+        candidate.direction,
+      ].join("|");
+
+      if (!primaryByGroup.has(groupKey)) {
+        primaryByGroup.set(groupKey, candidate);
+      }
+    }
+
+    const confirmations = Array.from(primaryByGroup.values()).map(
+      (candidate) => ({
+        detected_delay_id: candidate.id,
+        commute_id: candidate.commute_id,
+        operator: candidate.operator,
+        service_date: candidate.service_date,
+        direction: candidate.direction,
+        origin_station: candidate.origin_station,
+        destination_station: candidate.destination_station,
+        scheduled_departure_time: candidate.scheduled_departure_time,
+        scheduled_arrival_time: candidate.scheduled_arrival_time,
+        delay_minutes: candidate.delay_minutes,
+        candidate_rank: candidate.candidate_rank,
+        passenger_confirmation_status:
+          candidate.passenger_confirmation_status,
+        confirmation_notified_at: candidate.confirmation_notified_at,
+        copy: buildDelayConfirmationCopy(candidate),
+      })
+    );
+
+    return res.json({
+      success: true,
+      count: confirmations.length,
+      confirmations,
+    });
+  } catch (error) {
+    console.error("Pending delay confirmations error:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/respond-delay-confirmation", async (req, res) => {
+  try {
+    const userId = String(req.body?.user_id || "").trim();
+    const detectedDelayId = String(req.body?.detected_delay_id || "").trim();
+    const rawResponse = String(
+      req.body?.response ?? req.body?.travelled ?? ""
+    )
+      .trim()
+      .toLowerCase();
+
+    const responseValue = ["yes", "true", "1", "confirmed"].includes(
+      rawResponse
+    )
+      ? "yes"
+      : ["no", "false", "0", "rejected"].includes(rawResponse)
+        ? "no"
+        : null;
+
+    if (!userId || !detectedDelayId || !responseValue) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "user_id, detected_delay_id and response (yes/no) are required.",
+      });
+    }
+
+    const { data: detectedDelay, error: delayError } = await withTimeout(
+      supabaseAdmin
+        .from("detected_delays")
+        .select("*")
+        .eq("id", detectedDelayId)
+        .eq("user_id", userId)
+        .maybeSingle(),
+      10000,
+      "Passenger confirmation delayed service lookup"
+    );
+
+    if (delayError) {
+      throw delayError;
+    }
+
+    if (!detectedDelay) {
+      return res.status(404).json({
+        success: false,
+        error: "Detected delayed service not found.",
+      });
+    }
+
+    if (responseValue === "yes") {
+      if (detectedDelay.passenger_confirmation_status === "rejected") {
+        // A passenger may correct an accidental No before any competing service
+        // has been confirmed. This remains safe because the sibling check below
+        // prevents two confirmed services for the same commute window.
+      }
+
+      const { data: competingConfirmed, error: competingError } =
+        await withTimeout(
+          supabaseAdmin
+            .from("detected_delays")
+            .select("id, scheduled_departure_time, delay_minutes")
+            .eq("user_id", userId)
+            .eq("commute_id", detectedDelay.commute_id)
+            .eq("service_date", detectedDelay.service_date)
+            .eq("direction", detectedDelay.direction)
+            .eq("passenger_confirmation_status", "confirmed")
+            .neq("id", detectedDelay.id)
+            .limit(1),
+          10000,
+          "Competing confirmed delayed service lookup"
+        );
+
+      if (competingError) {
+        throw competingError;
+      }
+
+      if (competingConfirmed?.length) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "Another service in this commute window has already been confirmed.",
+          confirmed_service: competingConfirmed[0],
+        });
+      }
+
+      const exactScheduledTime = normaliseExactServiceTime(
+        detectedDelay.scheduled_departure_time || detectedDelay.scheduled_time
+      );
+
+      if (!exactScheduledTime) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "This candidate does not have an exact scheduled departure time, so a claim cannot be started.",
+        });
+      }
+
+      const now = new Date().toISOString();
+
+      const { data: confirmedDelay, error: confirmationError } =
+        await withTimeout(
+          supabaseAdmin
+            .from("detected_delays")
+            .update({
+              passenger_confirmation_status: "confirmed",
+              passenger_confirmed_at: now,
+              passenger_rejected_at: null,
+              status: "confirmed",
+              scheduled_time: exactScheduledTime,
+              updated_at: now,
+            })
+            .eq("id", detectedDelay.id)
+            .eq("user_id", userId)
+            .select("*")
+            .single(),
+          10000,
+          "Confirm delayed service"
+        );
+
+      if (confirmationError) {
+        throw confirmationError;
+      }
+
+      const resolvedNotifications = await resolveDelayConfirmationNotification({
+        userId,
+        detectedDelayId,
+        actionStatus: "confirmed",
+      });
+
+      const closedSiblingCandidates =
+        await closeSiblingCandidatesAfterConfirmation(confirmedDelay);
+
+      const claimAutomation = await ensureClaimForDetectedDelay(
+        confirmedDelay
+      );
+
+      return res.json({
+        success: true,
+        response: "yes",
+        message:
+          "Passenger confirmed the exact delayed service. Delai claim automation has been queued.",
+        detected_delay: confirmedDelay,
+        resolved_notifications: resolvedNotifications,
+        closed_sibling_candidates: closedSiblingCandidates,
+        claim: claimAutomation.claim,
+        automation_job: claimAutomation.automationJob,
+        next_step:
+          "Process the queued automation job to prepare the confirmed claim.",
+      });
+    }
+
+    if (detectedDelay.passenger_confirmation_status === "confirmed") {
+      return res.status(409).json({
+        success: false,
+        error:
+          "This service is already confirmed and claim automation may already have started.",
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    const { data: rejectedDelay, error: rejectionError } = await withTimeout(
+      supabaseAdmin
+        .from("detected_delays")
+        .update({
+          passenger_confirmation_status: "rejected",
+          passenger_rejected_at: now,
+          passenger_confirmed_at: null,
+          status: "rejected_by_passenger",
+          updated_at: now,
+        })
+        .eq("id", detectedDelay.id)
+        .eq("user_id", userId)
+        .select("*")
+        .single(),
+      10000,
+      "Reject delayed service candidate"
+    );
+
+    if (rejectionError) {
+      throw rejectionError;
+    }
+
+    const resolvedNotifications = await resolveDelayConfirmationNotification({
+      userId,
+      detectedDelayId,
+      actionStatus: "rejected",
+    });
+
+    const nextCandidateResult = await notifyNextDelayCandidateForGroup({
+      userId,
+      commuteId: rejectedDelay.commute_id,
+      serviceDate: rejectedDelay.service_date,
+      direction: rejectedDelay.direction,
+      afterRank: rejectedDelay.candidate_rank || 0,
+    });
+
+    return res.json({
+      success: true,
+      response: "no",
+      message: nextCandidateResult.candidate
+        ? "Passenger rejected this service. Delai has moved to the next qualifying delayed train in the commute window."
+        : "Passenger rejected this service. There are no more qualifying delayed trains to ask about in this commute window.",
+      detected_delay: rejectedDelay,
+      resolved_notifications: resolvedNotifications,
+      next_candidate: nextCandidateResult.candidate,
+      next_notification: nextCandidateResult.notification,
+    });
+  } catch (error) {
+    console.error("Respond delay confirmation error:", error);
+
+    return res.status(500).json({
+      success: false,
       error: error.message,
     });
   }
@@ -2931,6 +4022,28 @@ app.post("/submit-claim-with-delai", async (req, res) => {
         success: false,
         ready: false,
         error: "Linked detected delay not found",
+      });
+    }
+
+    if (detectedDelay.passenger_confirmation_status !== "confirmed") {
+      return res.status(409).json({
+        success: false,
+        ready: false,
+        customer_status: "passenger_confirmation_required",
+        error: "Passenger confirmation is required before this claim can be submitted.",
+      });
+    }
+
+    if (
+      !normaliseExactServiceTime(
+        detectedDelay.scheduled_departure_time || detectedDelay.scheduled_time
+      )
+    ) {
+      return res.status(409).json({
+        success: false,
+        ready: false,
+        customer_status: "exact_service_required",
+        error: "An exact scheduled departure time is required before this claim can be submitted.",
       });
     }
 
