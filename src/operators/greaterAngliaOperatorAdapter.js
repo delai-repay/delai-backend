@@ -38,7 +38,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
     });
 
     this.integrationStatus = getGreaterAngliaIntegrationStatus();
-    this.adapterVersion = "greater-anglia-1.3-audit";
+    this.adapterVersion = "greater-anglia-1.4-payments";
     this.submissionStrategy = "playwright_browser_automation";
   }
 
@@ -127,6 +127,24 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
     const portalSubmissionPlan = buildGreaterAngliaPortalSubmissionPlan(
       mappedSubmission
     );
+
+    // Keep decrypted payout details in memory for the browser executor only.
+    // A non-enumerable property is deliberately omitted from JSON responses,
+    // audit payloads and ordinary object logging.
+    if (submissionContext?.paymentDetails) {
+      Object.defineProperty(
+        portalSubmissionPlan.compensationStep,
+        "bankDetails",
+        {
+          value: submissionContext.paymentDetails,
+          enumerable: false,
+          configurable: false,
+          writable: false,
+        }
+      );
+      portalSubmissionPlan.compensationStep.preferredPaymentMethod =
+        submissionContext.paymentDetails.preferredPaymentMethod || "BACS";
+    }
 
     const submissionMode = getGreaterAngliaSubmissionMode();
     const playwrightExecutorEnabled = isGreaterAngliaPlaywrightExecutorEnabled();

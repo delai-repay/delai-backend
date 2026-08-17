@@ -12,13 +12,45 @@ import {
 import { getAllOperators } from "./operators/operatorCatalog.js";
 import { buildClaimSubmissionContext } from "./operators/claimSubmissionContext.js";
 import { validateSubmissionContext } from "./operators/submissionValidation.js";
+import {
+  getPaymentProfileSummary,
+  loadPaymentDetailsForOperator,
+  savePayoutBankDetails,
+} from "./payments/paymentProfileService.js";
+import {
+  collectFeeForClaim,
+  getCollectionSafety,
+  processPendingPaymentProviderEvents,
+  queueReadyFeeCollectionJobs,
+  refreshDirectDebitStatus,
+  startDirectDebitSetup,
+  storeGoCardlessWebhookEvents,
+} from "./payments/paymentAutomation.js";
+import { verifySignedWebhook } from "./payments/paymentCrypto.js";
+import {
+  buildSafeClaimResponse,
+  buildSafeSubmissionResponse,
+} from "./security/claimResponseSanitizer.js";
+import {
+  getCancelledJourneyRoute,
+  isCancelledService,
+  normaliseServiceStatus,
+} from "./delays/journeyDisruptionRouting.js";
 
 dotenv.config();
 
 const app = express();
 
 app.use(helmet());
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, _res, buffer) => {
+      if (req.originalUrl === "/payments/webhooks/gocardless") {
+        req.rawBody = Buffer.from(buffer);
+      }
+    },
+  })
+);
 
 const allowedOrigins = [
   "http://localhost:5173",
@@ -76,6 +108,63 @@ function getSafeLimit(value, fallback = 20, max = 100) {
   }
 
   return Math.min(parsed, max);
+}
+
+async function requireAuthenticatedUser(req, res, next) {
+  try {
+    const authorization = String(req.headers.authorization || "");
+    const tokenMatch = authorization.match(/^Bearer\s+(.+)$/i);
+
+    if (!tokenMatch?.[1]) {
+      return res.status(401).json({
+        success: false,
+        error: "Authentication required.",
+      });
+    }
+
+    const { data, error } = await supabaseAdmin.auth.getUser(tokenMatch[1]);
+
+    if (error || !data?.user) {
+      return res.status(401).json({
+        success: false,
+        error: "Your session is invalid or has expired.",
+      });
+    }
+
+    req.authUser = data.user;
+    return next();
+  } catch (error) {
+    console.error("Authentication check failed:", error.message);
+    return res.status(401).json({
+      success: false,
+      error: "Authentication could not be verified.",
+    });
+  }
+}
+
+function requireAutomationSecret(req, res, next) {
+  const configuredSecret = String(process.env.CRON_SECRET || "");
+  const suppliedSecret = String(req.headers["x-cron-secret"] || "");
+
+  if (!configuredSecret) {
+    if (process.env.NODE_ENV === "production") {
+      return res.status(503).json({
+        success: false,
+        error: "Automation security is not configured.",
+      });
+    }
+
+    return next();
+  }
+
+  if (suppliedSecret !== configuredSecret) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized automation request.",
+    });
+  }
+
+  return next();
 }
 
 function getFutureIsoDate({ minutes = 0, hours = 0, days = 0 }) {
@@ -612,6 +701,17 @@ const SENSITIVE_AUDIT_FIELD_PATTERNS = [
   "smartcardNumber",
   "bookingReference",
   "uniqueTicketReference",
+  "bankAccountName",
+  "accountHolderName",
+  "sortCode",
+  "bankSortCode",
+  "accountNumber",
+  "bankAccountNumber",
+  "iban",
+  "swiftCode",
+  "bic",
+  "paymentDetails",
+  "bankDetails",
 ];
 
 function shouldRedactAuditField(key) {
@@ -1288,6 +1388,9 @@ async function loadClaimSubmissionContext({
 
     commute = recentCommutes?.[0] || null;
   }
+
+  const paymentDetails = await loadPaymentDetailsForOperator(claim.user_id);
+
   const { data: authUserData, error: authUserError } =
   await withTimeout(
     supabaseAdmin.auth.admin.getUserById(
@@ -1310,6 +1413,7 @@ async function loadClaimSubmissionContext({
   authUser,
   seasonTicket,
   commute,
+  paymentDetails,
 });
 }
 async function submitClaimThroughOperatorAdapter({
@@ -1335,6 +1439,12 @@ async function submitClaimThroughOperatorAdapter({
 async function ensureClaimForDetectedDelay(detectedDelay) {
   if (!detectedDelay?.id || !detectedDelay?.user_id) {
     throw new Error("A valid detected delay is required before a claim can be created.");
+  }
+
+  if (isCancelledService(detectedDelay.service_status)) {
+    throw new Error(
+      "Cancelled journeys must use the cancellation compensation route, not the ordinary Delay Repay route."
+    );
   }
 
   if (detectedDelay.passenger_confirmation_status !== "confirmed") {
@@ -1414,6 +1524,146 @@ async function ensureClaimForDetectedDelay(detectedDelay) {
   return {
     claim,
     automationJob,
+  };
+}
+
+async function ensureCancelledAbandonedCompensationCase(detectedDelay) {
+  if (!detectedDelay?.id || !detectedDelay?.user_id) {
+    throw new Error(
+      "A valid cancelled service is required before a compensation case can be created."
+    );
+  }
+
+  if (!isCancelledService(detectedDelay.service_status)) {
+    throw new Error(
+      "Only a cancelled service can use the cancelled-journey compensation route."
+    );
+  }
+
+  if (detectedDelay.passenger_confirmation_status !== "confirmed") {
+    throw new Error(
+      "Passenger confirmation is required before Delai can route a cancelled journey."
+    );
+  }
+
+  const exactScheduledTime = normaliseExactServiceTime(
+    detectedDelay.scheduled_departure_time || detectedDelay.scheduled_time
+  );
+
+  if (!exactScheduledTime) {
+    throw new Error(
+      "An exact scheduled departure time is required before Delai can route a cancelled journey."
+    );
+  }
+
+  const { data: seasonTickets, error: ticketError } = await withTimeout(
+    supabaseAdmin
+      .from("season_tickets")
+      .select("*")
+      .eq("user_id", detectedDelay.user_id)
+      .order("created_at", { ascending: false }),
+    10000,
+    "Cancelled journey season ticket lookup"
+  );
+
+  if (ticketError) {
+    throw ticketError;
+  }
+
+  const serviceDate = String(
+    detectedDelay.service_date || detectedDelay.delay_date || ""
+  ).slice(0, 10);
+
+  const activeTicket =
+    (seasonTickets || []).find((ticket) => {
+      const validFrom = String(ticket.valid_from || "").slice(0, 10);
+      const validUntil = String(ticket.valid_until || "").slice(0, 10);
+
+      if (!serviceDate || !validFrom || !validUntil) return false;
+      return validFrom <= serviceDate && validUntil >= serviceDate;
+    }) || null;
+
+  const route = getCancelledJourneyRoute({
+    ticketType: activeTicket?.ticket_type,
+    journeyOutcome: "abandoned",
+  });
+
+  const now = new Date().toISOString();
+  const { data: routedDisruption, error: routeUpdateError } = await withTimeout(
+    supabaseAdmin
+      .from("detected_delays")
+      .update({
+        service_status: "cancelled",
+        journey_outcome: "abandoned",
+        journey_outcome_confirmed_at: now,
+        compensation_route: route.compensationRoute,
+        status: "confirmed",
+        updated_at: now,
+      })
+      .eq("id", detectedDelay.id)
+      .eq("user_id", detectedDelay.user_id)
+      .select("*")
+      .single(),
+    10000,
+    "Route cancelled journey compensation"
+  );
+
+  if (routeUpdateError) {
+    throw routeUpdateError;
+  }
+
+  const { data: existingClaim, error: existingClaimError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .select("*")
+      .eq("user_id", detectedDelay.user_id)
+      .eq("detected_delay_id", detectedDelay.id)
+      .maybeSingle(),
+    10000,
+    "Cancelled journey compensation case lookup"
+  );
+
+  if (existingClaimError) {
+    throw existingClaimError;
+  }
+
+  let claim = existingClaim;
+
+  if (!claim) {
+    const { data: insertedClaim, error: claimInsertError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .insert([
+          {
+            user_id: detectedDelay.user_id,
+            detected_delay_id: detectedDelay.id,
+            status: "prepared",
+            submission_status: route.submissionStatus,
+            submission_source: "cancelled_journey_routing",
+            submission_error: route.reason,
+            claim_type: route.claimType,
+            compensation_route: route.compensationRoute,
+            journey_outcome: "abandoned",
+          },
+        ])
+        .select("*")
+        .single(),
+      10000,
+      "Create cancelled journey compensation case"
+    );
+
+    if (claimInsertError) {
+      throw claimInsertError;
+    }
+
+    claim = insertedClaim;
+  }
+
+  return {
+    claim,
+    detectedDelay: routedDisruption,
+    route,
+    automationJob: null,
   };
 }
 
@@ -1500,6 +1750,26 @@ async function processClaimSubmitJob(job) {
     return {
       success: true,
       message: "Claim no longer exists.",
+    };
+  }
+
+  if (
+    claim.claim_type === "cancellation_compensation" ||
+    claim.claim_type === "cancellation_refund"
+  ) {
+    return {
+      success: true,
+      blocked: true,
+      ready: true,
+      message:
+        "This cancelled and abandoned journey has been routed safely and cannot be sent through the ordinary Delay Repay adapter.",
+      customer_status: claim.submission_status,
+      customer_title: "Cancelled journey recorded",
+      customer_message:
+        "Delai has recorded your abandoned cancellation and selected the correct compensation route.",
+      customer_next_step:
+        "No ordinary Delay Repay submission will be attempted. Delai will continue once the cancellation route adapter is connected.",
+      claim,
     };
   }
 
@@ -2219,21 +2489,23 @@ async function processClaimCollectFeeJob(job) {
     };
   }
 
-  await createClaimNotification({
-    userId: claim.user_id,
-    claimId: claim.id,
-    type: "claim_fee_due",
-    title: "Delai success fee due",
-    message: `Your claim compensation has been recorded. Delai's success fee is £${Number(
-      claim.delai_fee_amount || 0
-    ).toFixed(2)}.`,
-  });
+  const collectionResult = await collectFeeForClaim(claim);
 
-  return {
-    success: true,
-    message:
-      "Fee due notification created. Stripe fee collection will be connected next.",
-  };
+  if (collectionResult?.blocked) {
+    await createClaimNotification({
+      userId: claim.user_id,
+      claimId: claim.id,
+      type: "claim_fee_setup_required",
+      title: "Payment setup required",
+      message: `Your compensation has been recorded and Delai's 10% success fee is £${Number(
+        claim.delai_fee_amount || 0
+      ).toFixed(
+        2
+      )}. Complete or review Payment Details in your Delai account so the authorised Direct Debit can be processed.`,
+    });
+  }
+
+  return collectionResult;
 }
 
 async function processAutomationJob(job) {
@@ -2265,6 +2537,13 @@ async function processAutomationJob(job) {
 
 async function processAutomationJobs({ limit = 20 }) {
   const safeLimit = getSafeLimit(limit, 20, 100);
+
+  const paymentProviderEvents = await processPendingPaymentProviderEvents({
+    limit: safeLimit,
+  });
+  const queuedFeeCollections = await queueReadyFeeCollectionJobs({
+    limit: safeLimit,
+  });
 
   const queuedSubmittedClaims = await queueSubmittedClaimOutcomeJobs({
     limit: safeLimit,
@@ -2358,6 +2637,8 @@ async function processAutomationJobs({ limit = 20 }) {
 
   return {
     success: true,
+    payment_provider_events: paymentProviderEvents,
+    queued_fee_collections: queuedFeeCollections,
     queued_submitted_claims: queuedSubmittedClaims,
     processed_count: jobs?.length || 0,
     completed_count: completedCount,
@@ -2528,7 +2809,7 @@ function parseCommuteWindow(value) {
   };
 }
 
-function isTimeInsideCommuteWindow(time, windowValue) {
+function isTimeInsideCommuteWindow(time, windowValue, toleranceMinutes = 15) {
   const serviceMinutes = timeToMinutes(time);
   const window = parseCommuteWindow(windowValue);
 
@@ -2536,16 +2817,17 @@ function isTimeInsideCommuteWindow(time, windowValue) {
     return false;
   }
 
-  if (window.endMinutes >= window.startMinutes) {
-    return (
-      serviceMinutes >= window.startMinutes &&
-      serviceMinutes <= window.endMinutes
-    );
-  }
+  const safeTolerance = Math.max(0, Number(toleranceMinutes) || 0);
+  const startMinutes = window.startMinutes;
+  const endMinutes =
+    window.endMinutes >= window.startMinutes
+      ? window.endMinutes
+      : window.endMinutes + 24 * 60;
 
-  return (
-    serviceMinutes >= window.startMinutes ||
-    serviceMinutes <= window.endMinutes
+  return [serviceMinutes, serviceMinutes + 24 * 60].some(
+    (candidateMinutes) =>
+      candidateMinutes >= startMinutes - safeTolerance &&
+      candidateMinutes <= endMinutes + safeTolerance
   );
 }
 
@@ -2645,7 +2927,13 @@ function normaliseExactServiceCandidate(service = {}, fallbackDate = null) {
     service.actual_arrival_time ?? service.actualArrivalTime
   );
 
-  const suppliedDelay = Number(service.delay_minutes ?? service.delayMinutes);
+  const suppliedDelayValue = service.delay_minutes ?? service.delayMinutes;
+  const suppliedDelay =
+    suppliedDelayValue === undefined ||
+    suppliedDelayValue === null ||
+    String(suppliedDelayValue).trim() === ""
+      ? Number.NaN
+      : Number(suppliedDelayValue);
   const calculatedDelay = calculateDelayMinutesFromTimes({
     scheduledArrivalTime,
     actualArrivalTime,
@@ -2656,6 +2944,11 @@ function normaliseExactServiceCandidate(service = {}, fallbackDate = null) {
   const delayMinutes = Number.isFinite(suppliedDelay)
     ? Math.max(0, suppliedDelay)
     : calculatedDelay;
+
+  const serviceStatus = normaliseServiceStatus(
+    service.service_status ?? service.serviceStatus ?? service.status,
+    service.cancelled === true || service.canceled === true
+  );
 
   return {
     serviceIdentifier:
@@ -2695,8 +2988,19 @@ function normaliseExactServiceCandidate(service = {}, fallbackDate = null) {
     scheduledArrivalTime,
     actualDepartureTime,
     actualArrivalTime,
+    serviceStatus,
+    disruptionReason:
+      String(
+        service.disruption_reason ??
+          service.disruptionReason ??
+          service.cancellation_reason ??
+          service.cancellationReason ??
+          ""
+      ).trim() || null,
     delayMinutes:
-      delayMinutes === null || Number.isNaN(delayMinutes)
+      isCancelledService(serviceStatus) ||
+      delayMinutes === null ||
+      Number.isNaN(delayMinutes)
         ? null
         : Math.round(delayMinutes),
     source:
@@ -2751,7 +3055,7 @@ function serviceMatchesCommuteDirection({
 async function findExistingExactDetectedDelay({ commute, service, direction }) {
   let existingQuery = supabaseAdmin
     .from("detected_delays")
-    .select("id, passenger_confirmation_status, candidate_rank")
+    .select("id, passenger_confirmation_status, candidate_rank, service_status, journey_outcome, compensation_route")
     .eq("user_id", commute.user_id)
     .eq("commute_id", commute.id)
     .eq("service_date", service.serviceDate)
@@ -2795,18 +3099,41 @@ function buildDelayConfirmationCopy(detectedDelay) {
 
   const delayMinutes = Number(detectedDelay?.delay_minutes || 0);
 
+  if (isCancelledService(detectedDelay?.service_status)) {
+    const serviceLabel = scheduledTime
+      ? `${scheduledTime} ${route}`
+      : route;
+
+    return {
+      type: "delay_confirmation_required",
+      actionType: "confirm_cancelled_journey_outcome",
+      title: scheduledTime
+        ? `Did you abandon the ${scheduledTime} journey?`
+        : "Did you abandon this cancelled journey?",
+      message: `Your ${serviceLabel} service was reported as cancelled. Did you abandon the journey without travelling?`,
+      confirmLabel: "Yes — I abandoned the journey",
+      rejectLabel: "No — this wasn't my journey",
+    };
+  }
+
   if (!scheduledTime) {
     return {
       type: "delay_confirmation_required",
+      actionType: "confirm_delayed_service",
       title: "Were you on this delayed train?",
       message: `Your ${route} service was delayed by ${delayMinutes} minute${delayMinutes === 1 ? "" : "s"}. Were you on this train?`,
+      confirmLabel: "Yes — claim my compensation",
+      rejectLabel: "No — I wasn't on this train",
     };
   }
 
   return {
     type: "delay_confirmation_required",
+    actionType: "confirm_delayed_service",
     title: `Were you on the ${scheduledTime} train?`,
     message: `Your ${scheduledTime} ${route} service was delayed by ${delayMinutes} minute${delayMinutes === 1 ? "" : "s"}. Were you on this train?`,
+    confirmLabel: "Yes — claim my compensation",
+    rejectLabel: "No — I wasn't on this train",
   };
 }
 
@@ -2876,7 +3203,7 @@ async function createDelayConfirmationNotification(detectedDelay) {
           message: copy.message,
           read: false,
           action_required: true,
-          action_type: "confirm_delayed_service",
+          action_type: copy.actionType || "confirm_delayed_service",
           action_status: "pending",
         },
       ])
@@ -3076,7 +3403,7 @@ async function closeSiblingCandidatesAfterConfirmation(detectedDelay) {
   return data || [];
 }
 
-app.post("/detect-delays", async (req, res) => {
+app.post("/detect-delays", requireAutomationSecret, async (req, res) => {
   try {
     const { data: commutes, error: commuteError } = await withTimeout(
       supabaseAdmin.from("commutes").select("*"),
@@ -3116,14 +3443,15 @@ app.post("/detect-delays", async (req, res) => {
           service.originStation &&
           service.destinationStation &&
           service.scheduledDepartureTime &&
-          service.delayMinutes !== null
+          (isCancelledService(service.serviceStatus) ||
+            service.delayMinutes !== null)
       );
 
     if (exactServices.length === 0) {
       return res.json({
         ok: true,
         message:
-          "No exact train services were supplied, so Delai did not fabricate a delay from the commute window.",
+          "No valid exact delayed or cancelled train services were supplied, so Delai did not fabricate a disruption from the commute window.",
         provider_status: "exact_service_feed_required",
         checked_commutes: commutes.length,
         supplied_service_count: suppliedServices.length,
@@ -3193,10 +3521,22 @@ app.post("/detect-delays", async (req, res) => {
         const thresholdMinutes = getDelayRepayThresholdMinutes(commute.operator);
 
         const qualifyingServices = matchedServices
-          .filter((service) => Number(service.delayMinutes) >= thresholdMinutes)
+          .filter(
+            (service) =>
+              isCancelledService(service.serviceStatus) ||
+              Number(service.delayMinutes) >= thresholdMinutes
+          )
           .sort((left, right) => {
+            const cancellationDifference =
+              Number(isCancelledService(right.serviceStatus)) -
+              Number(isCancelledService(left.serviceStatus));
+
+            if (cancellationDifference !== 0) {
+              return cancellationDifference;
+            }
+
             const delayDifference =
-              Number(right.delayMinutes) - Number(left.delayMinutes);
+              Number(right.delayMinutes || 0) - Number(left.delayMinutes || 0);
 
             if (delayDifference !== 0) {
               return delayDifference;
@@ -3234,6 +3574,8 @@ app.post("/detect-delays", async (req, res) => {
               candidate_rank: existingDelay.candidate_rank || candidateRank,
               scheduled_departure_time: service.scheduledDepartureTime,
               delay_minutes: service.delayMinutes,
+              service_status: service.serviceStatus,
+              disruption_reason: service.disruptionReason,
               passenger_confirmation_status:
                 existingDelay.passenger_confirmation_status || "pending",
               existing: true,
@@ -3260,6 +3602,11 @@ app.post("/detect-delays", async (req, res) => {
             actual_time:
               service.actualArrivalTime || service.actualDepartureTime || null,
             delay_minutes: service.delayMinutes,
+            service_status: service.serviceStatus,
+            journey_outcome: null,
+            journey_outcome_confirmed_at: null,
+            compensation_route: null,
+            disruption_reason: service.disruptionReason,
             candidate_rank: candidateRank,
             status: "awaiting_confirmation",
             passenger_confirmation_status: "pending",
@@ -3300,6 +3647,8 @@ app.post("/detect-delays", async (req, res) => {
             actual_departure_time: service.actualDepartureTime,
             actual_arrival_time: service.actualArrivalTime,
             delay_minutes: service.delayMinutes,
+            service_status: service.serviceStatus,
+            disruption_reason: service.disruptionReason,
             passenger_confirmation_status: "pending",
             existing: false,
           });
@@ -3313,6 +3662,7 @@ app.post("/detect-delays", async (req, res) => {
               candidate_rank: candidateRank,
               scheduled_departure_time: service.scheduledDepartureTime,
               delay_minutes: service.delayMinutes,
+              service_status: service.serviceStatus,
             }
           );
         }
@@ -3383,7 +3733,7 @@ app.post("/detect-delays", async (req, res) => {
     res.json({
       ok: true,
       message:
-        "Exact-service delay detection completed. Qualifying delayed services are awaiting passenger confirmation.",
+        "Exact-service disruption detection completed. Qualifying delayed and cancelled services are awaiting passenger confirmation.",
       provider_status: "exact_service_model_active",
       checked_commutes: commutes.length,
       supplied_service_count: suppliedServices.length,
@@ -3409,16 +3759,9 @@ app.post("/detect-delays", async (req, res) => {
 });
 
 
-app.get("/pending-delay-confirmations", async (req, res) => {
+app.get("/pending-delay-confirmations", requireAuthenticatedUser, async (req, res) => {
   try {
-    const userId = String(req.query?.user_id || "").trim();
-
-    if (!userId) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing user_id",
-      });
-    }
+    const userId = req.authUser.id;
 
     const { data, error } = await withTimeout(
       supabaseAdmin
@@ -3532,6 +3875,10 @@ app.get("/pending-delay-confirmations", async (req, res) => {
         scheduled_departure_time: candidate.scheduled_departure_time,
         scheduled_arrival_time: candidate.scheduled_arrival_time,
         delay_minutes: candidate.delay_minutes,
+        service_status: candidate.service_status || "delayed",
+        journey_outcome: candidate.journey_outcome || null,
+        compensation_route: candidate.compensation_route || null,
+        disruption_reason: candidate.disruption_reason || null,
         candidate_rank: candidate.candidate_rank,
         passenger_confirmation_status:
           candidate.passenger_confirmation_status,
@@ -3555,9 +3902,9 @@ app.get("/pending-delay-confirmations", async (req, res) => {
   }
 });
 
-app.post("/respond-delay-confirmation", async (req, res) => {
+app.post("/respond-delay-confirmation", requireAuthenticatedUser, async (req, res) => {
   try {
-    const userId = String(req.body?.user_id || "").trim();
+    const userId = req.authUser.id;
     const detectedDelayId = String(req.body?.detected_delay_id || "").trim();
     const rawResponse = String(
       req.body?.response ?? req.body?.travelled ?? ""
@@ -3565,7 +3912,7 @@ app.post("/respond-delay-confirmation", async (req, res) => {
       .trim()
       .toLowerCase();
 
-    const responseValue = ["yes", "true", "1", "confirmed"].includes(
+    const responseValue = ["yes", "true", "1", "confirmed", "abandoned"].includes(
       rawResponse
     )
       ? "yes"
@@ -3573,11 +3920,11 @@ app.post("/respond-delay-confirmation", async (req, res) => {
         ? "no"
         : null;
 
-    if (!userId || !detectedDelayId || !responseValue) {
+    if (!detectedDelayId || !responseValue) {
       return res.status(400).json({
         success: false,
         error:
-          "user_id, detected_delay_id and response (yes/no) are required.",
+          "detected_delay_id and response (yes/no) are required.",
       });
     }
 
@@ -3673,6 +4020,9 @@ app.post("/respond-delay-confirmation", async (req, res) => {
       }
 
       const now = new Date().toISOString();
+      const cancelledJourney = isCancelledService(
+        detectedDelay.service_status
+      );
 
       const { data: confirmedDelay, error: confirmationError } =
         await withTimeout(
@@ -3683,6 +4033,8 @@ app.post("/respond-delay-confirmation", async (req, res) => {
               passenger_confirmed_at: now,
               passenger_rejected_at: null,
               status: "confirmed",
+              journey_outcome: cancelledJourney ? "abandoned" : "travelled",
+              journey_outcome_confirmed_at: now,
               scheduled_time: exactScheduledTime,
               updated_at: now,
             })
@@ -3707,22 +4059,29 @@ app.post("/respond-delay-confirmation", async (req, res) => {
       const closedSiblingCandidates =
         await closeSiblingCandidatesAfterConfirmation(confirmedDelay);
 
-      const claimAutomation = await ensureClaimForDetectedDelay(
-        confirmedDelay
-      );
+      const claimAutomation = cancelledJourney
+        ? await ensureCancelledAbandonedCompensationCase(confirmedDelay)
+        : await ensureClaimForDetectedDelay(confirmedDelay);
+
+      const finalDetectedDelay =
+        claimAutomation.detectedDelay || confirmedDelay;
 
       return res.json({
         success: true,
-        response: "yes",
-        message:
-          "Passenger confirmed the exact delayed service. Delai claim automation has been queued.",
-        detected_delay: confirmedDelay,
+        response: cancelledJourney ? "abandoned" : "yes",
+        message: cancelledJourney
+          ? "Passenger confirmed the cancelled journey was abandoned. Delai has routed it to the correct compensation workflow without creating a normal Delay Repay submission."
+          : "Passenger confirmed the exact delayed service. Delai claim automation has been queued.",
+        detected_delay: finalDetectedDelay,
         resolved_notifications: resolvedNotifications,
         closed_sibling_candidates: closedSiblingCandidates,
         claim: claimAutomation.claim,
         automation_job: claimAutomation.automationJob,
-        next_step:
-          "Process the queued automation job to prepare the confirmed claim.",
+        compensation_route:
+          claimAutomation.route?.compensationRoute || "delay_repay",
+        next_step: cancelledJourney
+          ? "The ordinary Delay Repay adapter is blocked for this case. Connect the cancellation compensation adapter before automatic submission."
+          : "Process the queued automation job to prepare the confirmed claim.",
       });
     }
 
@@ -3982,14 +4341,15 @@ Suggested next action:
     });
   }
 });
-app.post("/validate-claim-submission", async (req, res) => {
+app.post("/validate-claim-submission", requireAuthenticatedUser, async (req, res) => {
   try {
-    const { user_id, claim_id } = req.body;
+    const { claim_id } = req.body || {};
+    const user_id = req.authUser.id;
 
-    if (!user_id || !claim_id) {
+    if (!claim_id) {
       return res.status(400).json({
         success: false,
-        error: "Missing user_id or claim_id",
+        error: "Missing claim_id",
       });
     }
 
@@ -4045,6 +4405,25 @@ app.post("/validate-claim-submission", async (req, res) => {
       });
     }
 
+    if (
+      isCancelledService(detectedDelay.service_status) ||
+      claim.claim_type === "cancellation_compensation" ||
+      claim.claim_type === "cancellation_refund"
+    ) {
+      return res.json({
+        success: true,
+        ready_for_submission: false,
+        blocked: true,
+        customer_status:
+          claim.submission_status || "awaiting_cancellation_adapter",
+        message:
+          "This cancelled journey cannot use the ordinary Delay Repay submission adapter.",
+        compensation_route:
+          claim.compensation_route || detectedDelay.compensation_route || null,
+        claim: buildSafeClaimResponse(claim),
+      });
+    }
+
     const submissionContext =
       await loadClaimSubmissionContext({
         claim,
@@ -4082,21 +4461,21 @@ app.post("/validate-claim-submission", async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Failed to validate claim submission",
-      details: error.message,
     });
   }
 });
 
 
-app.post("/submit-claim-with-delai", async (req, res) => {
+app.post("/submit-claim-with-delai", requireAuthenticatedUser, async (req, res) => {
   try {
-    const { user_id, claim_id } = req.body || {};
+    const { claim_id } = req.body || {};
+    const user_id = req.authUser.id;
 
-    if (!user_id || !claim_id) {
+    if (!claim_id) {
       return res.status(400).json({
         success: false,
         ready: false,
-        error: "Missing user_id or claim_id",
+        error: "Missing claim_id",
       });
     }
 
@@ -4130,7 +4509,7 @@ app.post("/submit-claim-with-delai", async (req, res) => {
         submitted: true,
         message:
           "This claim has already been submitted. Delai will continue tracking it automatically.",
-        claim,
+        claim: buildSafeClaimResponse(claim),
         claim_status: claim.status,
         submission_status: claim.submission_status || "submitted",
       });
@@ -4164,6 +4543,26 @@ app.post("/submit-claim-with-delai", async (req, res) => {
         success: false,
         ready: false,
         error: "Linked detected delay not found",
+      });
+    }
+
+    if (
+      isCancelledService(detectedDelay.service_status) ||
+      claim.claim_type === "cancellation_compensation" ||
+      claim.claim_type === "cancellation_refund"
+    ) {
+      return res.status(409).json({
+        success: false,
+        ready: false,
+        blocked: true,
+        customer_status:
+          claim.submission_status || "awaiting_cancellation_adapter",
+        customer_title: "Cancelled journey recorded",
+        customer_message:
+          "This abandoned cancellation has been routed safely and cannot be submitted through the ordinary Delay Repay adapter.",
+        compensation_route:
+          claim.compensation_route || detectedDelay.compensation_route || null,
+        claim: buildSafeClaimResponse(claim),
       });
     }
 
@@ -4287,11 +4686,11 @@ app.post("/submit-claim-with-delai", async (req, res) => {
         success: true,
         ready: true,
         blocked: true,
-        claim: finalClaim,
+        claim: buildSafeClaimResponse(finalClaim),
         claim_status: finalClaim?.status || "ready_to_submit",
         submission_status: submissionStatus,
         validation: validationResponse,
-        submission: submissionResult.submission || submissionResult,
+        submission: buildSafeSubmissionResponse(submissionResult),
         message: customerMessage,
         customer_message: customerMessage,
         customer_title: awaitingInformation
@@ -4316,15 +4715,14 @@ app.post("/submit-claim-with-delai", async (req, res) => {
       success: true,
       ready: true,
       submitted: finalClaim?.status === "submitted",
-      claim: finalClaim,
+      claim: buildSafeClaimResponse(finalClaim),
       claim_status: finalClaim?.status || "ready_to_submit",
       submission_status:
         finalClaim?.submission_status ||
         submissionResult.submission?.status ||
         null,
       validation: validationResponse,
-      prepared_summary: preparedClaim?.prepared_summary || null,
-      submission: submissionResult,
+      submission: buildSafeSubmissionResponse(submissionResult),
       message:
         submissionResult.message ||
         "Delai has started the claim submission process.",
@@ -4336,7 +4734,6 @@ app.post("/submit-claim-with-delai", async (req, res) => {
       success: false,
       ready: false,
       error: "Failed to submit claim with Delai",
-      details: error.message,
     });
   }
 });
@@ -5028,6 +5425,120 @@ async function processAutomationJobsHandler(req, res) {
 
 app.post("/process-automation-jobs", processAutomationJobsHandler);
 app.get("/process-automation-jobs", processAutomationJobsHandler);
+
+app.get("/payment-profile", requireAuthenticatedUser, async (req, res) => {
+  try {
+    const profile = await refreshDirectDebitStatus(req.authUser.id).catch(
+      async (error) => {
+        console.error("Payment-provider status refresh failed:", error.message);
+        return getPaymentProfileSummary(req.authUser.id);
+      }
+    );
+    const safety = getCollectionSafety();
+
+    return res.json({
+      success: true,
+      payment_profile: profile,
+      payment_provider: {
+        configured: safety.provider.configured,
+        environment: safety.provider.environment,
+        fee_collection_enabled: safety.collectionEnabled,
+        live_collection_enabled: safety.liveCollectionEnabled,
+      },
+    });
+  } catch (error) {
+    console.error("Payment profile lookup failed:", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Payment Details could not be loaded.",
+    });
+  }
+});
+
+app.put("/payment-profile", requireAuthenticatedUser, async (req, res) => {
+  try {
+    const profile = await savePayoutBankDetails(req.authUser.id, req.body || {});
+
+    return res.json({
+      success: true,
+      message: "Operator payout account saved securely.",
+      payment_profile: profile,
+    });
+  } catch (error) {
+    const isValidationError = error.code === "invalid_payment_profile";
+    console.error("Payment profile save failed:", {
+      user_id: req.authUser.id,
+      code: error.code || "payment_profile_save_failed",
+    });
+
+    return res.status(isValidationError ? 400 : 500).json({
+      success: false,
+      error: isValidationError
+        ? error.message
+        : "Payment Details could not be saved.",
+      validation_errors: isValidationError
+        ? error.validationErrors || []
+        : undefined,
+    });
+  }
+});
+
+app.post(
+  "/payment-profile/direct-debit/setup",
+  requireAuthenticatedUser,
+  async (req, res) => {
+    try {
+      const result = await startDirectDebitSetup(req.authUser.id);
+
+      return res.json({
+        success: true,
+        ...result,
+      });
+    } catch (error) {
+      const userActionErrors = new Set([
+        "payment_provider_not_configured",
+        "payout_account_required",
+        "fee_terms_required",
+      ]);
+      const status = userActionErrors.has(error.code) ? 400 : 502;
+
+      console.error("Direct Debit setup failed:", {
+        user_id: req.authUser.id,
+        code: error.code || error.reason || "direct_debit_setup_failed",
+      });
+
+      return res.status(status).json({
+        success: false,
+        error:
+          status === 400
+            ? error.message
+            : "Direct Debit setup could not be started. Please try again.",
+      });
+    }
+  }
+);
+
+app.post("/payments/webhooks/gocardless", async (req, res) => {
+  const webhookSecret = process.env.GOCARDLESS_WEBHOOK_SECRET;
+  const signature = req.headers["webhook-signature"];
+  const validSignature = verifySignedWebhook({
+    rawBody: req.rawBody,
+    suppliedSignature: signature,
+    secret: webhookSecret,
+  });
+
+  if (!validSignature) {
+    return res.status(498).send("Invalid webhook signature");
+  }
+
+  try {
+    await storeGoCardlessWebhookEvents(req.body?.events || []);
+    return res.status(204).send();
+  } catch (error) {
+    console.error("GoCardless webhook storage failed:", error.message);
+    return res.status(500).send("Webhook could not be stored");
+  }
+});
 
 app.post("/update-claim-payment", async (req, res) => {
   try {

@@ -8,7 +8,7 @@ const GREATER_ANGLIA_DELAY_REPAY_PORTAL = {
     "https://greateranglia.delayrepaycompensation.com/index.cfm?action=myclaims.appeal",
   submissionMethod: "playwright_browser_automation",
   provider: "Tracsis Travel Compensation Services",
-  currentStrategyVersion: "greater-anglia-browser-strategy-1.1",
+  currentStrategyVersion: "greater-anglia-browser-strategy-1.5",
 };
 
 const DELAY_BANDS = [
@@ -192,14 +192,27 @@ function buildGreaterAngliaPortalSubmissionPlan(mappedSubmission = {}) {
       ticketClass: "Standard Class",
     },
     passengerStep: {
+      title:
+        cleanText(passenger.title) ||
+        cleanText(passenger.salutation) ||
+        cleanText(process.env.GREATER_ANGLIA_DEFAULT_TITLE),
       fullName: cleanText(passenger.fullName),
       email: cleanText(passenger.email),
+      confirmEmail: cleanText(passenger.email),
       mobile: cleanText(passenger.mobile),
       addressLine1: cleanText(passenger.addressLine1),
       addressLine2: cleanText(passenger.addressLine2),
       townCity: cleanText(passenger.townCity),
       postcode: cleanText(passenger.postcode),
       country: cleanText(passenger.country) || "United Kingdom",
+      addressSearchText: [
+        cleanText(passenger.addressLine1),
+        cleanText(passenger.addressLine2),
+        cleanText(passenger.townCity),
+        cleanText(passenger.postcode),
+      ]
+        .filter(Boolean)
+        .join(" "),
     },
     compensationStep: {
       preferredPaymentMethod:
@@ -237,8 +250,20 @@ function buildGreaterAngliaPortalSubmissionPlan(mappedSubmission = {}) {
     missingAutomationInputs.push("delay band");
   }
 
+  if (!plan.passengerStep.title) {
+    missingAutomationInputs.push("passenger title");
+  }
+
   if (!plan.passengerStep.fullName || !plan.passengerStep.email) {
     missingAutomationInputs.push("passenger contact details");
+  }
+
+  if (!plan.passengerStep.postcode) {
+    missingAutomationInputs.push("passenger postcode");
+  }
+
+  if (!plan.passengerStep.addressLine1) {
+    missingAutomationInputs.push("passenger address line 1");
   }
 
   if (!plan.ticketStep.smartcardNumber && !plan.ticketStep.uniqueTicketReference) {

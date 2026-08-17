@@ -42,6 +42,7 @@ function buildClaimSubmissionContext({
   authUser = null,
   seasonTicket = null,
   commute = null,
+  paymentDetails = null,
 }) {
   if (!claim?.id) {
     throw new Error("A valid claim is required to build submission context.");
@@ -59,7 +60,7 @@ function buildClaimSubmissionContext({
   const operatorIdentity = resolveOperatorIdentity(rawOperatorName);
 
   return {
-    contextVersion: "1.1",
+    contextVersion: "1.3-payments",
     generatedAt: new Date().toISOString(),
 
     claim: {
@@ -81,6 +82,18 @@ function buildClaimSubmissionContext({
     },
 
     passenger: {
+      title:
+        cleanText(profile?.title) ||
+        cleanText(profile?.salutation) ||
+        cleanText(authUser?.user_metadata?.title) ||
+        cleanText(authUser?.user_metadata?.salutation),
+
+      salutation:
+        cleanText(profile?.title) ||
+        cleanText(profile?.salutation) ||
+        cleanText(authUser?.user_metadata?.title) ||
+        cleanText(authUser?.user_metadata?.salutation),
+
       fullName:
         cleanText(profile?.full_name) ||
         cleanText(profile?.name) ||
@@ -119,6 +132,9 @@ function buildClaimSubmissionContext({
         cleanText(profile?.post_code),
 
       country: cleanText(profile?.country) || "United Kingdom",
+
+      preferredPaymentMethod:
+        cleanText(paymentDetails?.preferredPaymentMethod) || "BACS",
     },
 
     journey: {
@@ -181,6 +197,17 @@ function buildClaimSubmissionContext({
       travelDays: cleanTravelDays(commute?.travel_days),
       operator: cleanText(commute?.operator),
     },
+
+    paymentDetails: paymentDetails
+      ? {
+          preferredPaymentMethod:
+            cleanText(paymentDetails.preferredPaymentMethod) || "BACS",
+          bankAccountName: cleanText(paymentDetails.bankAccountName),
+          accountHolderName: cleanText(paymentDetails.accountHolderName),
+          sortCode: cleanText(paymentDetails.sortCode),
+          accountNumber: cleanText(paymentDetails.accountNumber),
+        }
+      : null,
   };
 }
 
