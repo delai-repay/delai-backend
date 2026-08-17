@@ -14,6 +14,22 @@ function buildSafeClaimResponse(claim = {}) {
     claim_type: cleanString(claim.claim_type, 80),
     compensation_route: cleanString(claim.compensation_route, 100),
     journey_outcome: cleanString(claim.journey_outcome, 60),
+    cancellation_adapter_key: cleanString(
+      claim.cancellation_adapter_key,
+      100
+    ),
+    cancellation_policy_version: cleanString(
+      claim.cancellation_policy_version,
+      120
+    ),
+    cancellation_case_prepared_at: cleanString(
+      claim.cancellation_case_prepared_at,
+      40
+    ),
+    cancellation_submission_channel: cleanString(
+      claim.cancellation_submission_channel,
+      120
+    ),
     submitted_at: cleanString(claim.submitted_at, 40),
     operator_reference: cleanString(claim.operator_reference, 120),
     outcome: cleanString(claim.outcome, 60),
@@ -55,6 +71,18 @@ function buildSafeSubmissionResponse(result = {}) {
     ),
     integration_status: cleanString(
       source?.integrationStatus || source?.integration_status,
+      120
+    ),
+    submission_status: cleanString(
+      source?.submissionStatus || source?.submission_status,
+      100
+    ),
+    policy_version: cleanString(
+      source?.policyVersion || source?.policy_version,
+      120
+    ),
+    submission_channel: cleanString(
+      source?.submissionChannel || source?.submission_channel,
       120
     ),
     final_submit_enabled: source?.finalSubmitEnabled === true,

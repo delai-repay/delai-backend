@@ -36,6 +36,8 @@ import {
   isCancelledService,
   normaliseServiceStatus,
 } from "./delays/journeyDisruptionRouting.js";
+import { getCancellationAdapter } from "./cancellations/cancellationAdapterRegistry.js";
+import { validateCancellationSubmissionContext } from "./cancellations/cancellationValidation.js";
 
 dotenv.config();
 
@@ -1331,8 +1333,7 @@ async function loadClaimSubmissionContext({
       .from("season_tickets")
       .select("*")
       .eq("user_id", claim.user_id)
-      .order("created_at", { ascending: false })
-      .limit(1),
+      .order("created_at", { ascending: false }),
     10000,
     "Submission season ticket lookup"
   );
@@ -1341,7 +1342,22 @@ async function loadClaimSubmissionContext({
     throw seasonTicketError;
   }
 
-  const seasonTicket = seasonTickets?.[0] || null;
+  const serviceDate = String(
+    detectedDelay.service_date || detectedDelay.delay_date || ""
+  ).slice(0, 10);
+
+  const seasonTicket =
+    (seasonTickets || []).find((ticket) => {
+      const validFrom = String(
+        ticket.valid_from || ticket.ticket_start_date || ""
+      ).slice(0, 10);
+      const validUntil = String(
+        ticket.valid_until || ticket.ticket_end_date || ""
+      ).slice(0, 10);
+
+      if (!serviceDate || !validFrom || !validUntil) return false;
+      return validFrom <= serviceDate && validUntil >= serviceDate;
+    }) || seasonTickets?.[0] || null;
 
   let commute = null;
 
@@ -1433,6 +1449,41 @@ async function submitClaimThroughOperatorAdapter({
     claim,
     detectedDelay,
     submissionContext,
+  });
+}
+
+async function submitCancellationThroughAdapter({
+  claim,
+  detectedDelay,
+  submissionContext,
+}) {
+  const cancellationAdapter = getCancellationAdapter({
+    operator:
+      submissionContext?.operator?.suppliedName ||
+      detectedDelay?.operator,
+    compensationRoute:
+      claim?.compensation_route ||
+      detectedDelay?.compensation_route,
+  });
+
+  return cancellationAdapter.submitCase({
+    claim,
+    detectedDelay,
+    submissionContext,
+  });
+}
+
+async function queueCancellationCompensationSubmission(claim) {
+  if (!claim?.id || !claim?.user_id) {
+    throw new Error(
+      "A valid cancellation compensation case is required before submission can be queued."
+    );
+  }
+
+  return queueAutomationJob({
+    userId: claim.user_id,
+    claimId: claim.id,
+    jobType: "claim_submit",
   });
 }
 
@@ -1659,11 +1710,16 @@ async function ensureCancelledAbandonedCompensationCase(detectedDelay) {
     claim = insertedClaim;
   }
 
+  const automationJob =
+    route.claimType === "cancellation_compensation"
+      ? await queueCancellationCompensationSubmission(claim)
+      : null;
+
   return {
     claim,
     detectedDelay: routedDisruption,
     route,
-    automationJob: null,
+    automationJob,
   };
 }
 
@@ -1730,6 +1786,222 @@ async function processClaimPrepareJob(job) {
   };
 }
 
+async function processCancellationCompensationSubmitJob({
+  claim,
+  detectedDelay,
+}) {
+  const submissionContext = await loadClaimSubmissionContext({
+    claim,
+    detectedDelay,
+  });
+  const validation =
+    validateCancellationSubmissionContext(submissionContext);
+  const attemptedAt = new Date().toISOString();
+
+  if (!validation.readyForSubmission) {
+    const validationResponse = buildValidationResponse(validation);
+    const customerMessage =
+      "A few details are still needed before Delai can prepare this cancellation compensation case.";
+
+    const { data: blockedClaim, error: validationUpdateError } =
+      await withTimeout(
+        supabaseAdmin
+          .from("claims")
+          .update({
+            status: "prepared",
+            submission_status: "awaiting_information",
+            submission_attempted_at: attemptedAt,
+            submission_error: customerMessage,
+            submission_source: "cancellation_submission_validation",
+          })
+          .eq("id", claim.id)
+          .eq("user_id", claim.user_id)
+          .select("*")
+          .single(),
+        10000,
+        "Block invalid cancellation compensation submission"
+      );
+
+    if (validationUpdateError) {
+      throw validationUpdateError;
+    }
+
+    return {
+      success: true,
+      blocked: true,
+      ready: false,
+      message: customerMessage,
+      customer_message: customerMessage,
+      customer_title: "Cancellation details required",
+      customer_status: "awaiting_information",
+      validation: validationResponse,
+      blocking_issues: validationResponse.blocking_issues,
+      missing_fields: validationResponse.missing_fields,
+      claim: blockedClaim,
+    };
+  }
+
+  const { error: processingUpdateError } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .update({
+        status: "ready_to_submit",
+        submission_status: "processing",
+        submission_attempted_at: attemptedAt,
+        submission_error: null,
+      })
+      .eq("id", claim.id)
+      .eq("user_id", claim.user_id),
+    10000,
+    "Mark cancellation compensation processing"
+  );
+
+  if (processingUpdateError) {
+    throw processingUpdateError;
+  }
+
+  const submissionStartedAt = new Date().toISOString();
+  let submissionResult = null;
+  let operatorSubmissionAudit = null;
+
+  try {
+    submissionResult = await submitCancellationThroughAdapter({
+      claim,
+      detectedDelay,
+      submissionContext,
+    });
+  } catch (submissionError) {
+    operatorSubmissionAudit = await recordOperatorSubmissionAttempt({
+      claim,
+      detectedDelay,
+      submissionContext,
+      startedAt: submissionStartedAt,
+      completedAt: new Date().toISOString(),
+      error: submissionError,
+    });
+
+    throw submissionError;
+  }
+
+  operatorSubmissionAudit = await recordOperatorSubmissionAttempt({
+    claim,
+    detectedDelay,
+    submissionContext,
+    submissionResult,
+    startedAt: submissionStartedAt,
+    completedAt: new Date().toISOString(),
+  });
+
+  const cancellationMetadata = {
+    cancellation_adapter_key:
+      submissionResult.operatorKey || submissionContext.operator?.key || null,
+    cancellation_policy_version:
+      submissionResult.policyVersion || null,
+    cancellation_case_prepared_at: new Date().toISOString(),
+    cancellation_submission_channel:
+      submissionResult.submissionChannel || null,
+  };
+
+  if (!submissionResult.submitted) {
+    const submissionStatus =
+      submissionResult.submissionStatus ||
+      (submissionResult.ready
+        ? "cancellation_adapter_ready"
+        : "awaiting_cancellation_adapter");
+
+    const { data: readyClaim, error: blockUpdateError } = await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "ready_to_submit",
+          submission_status: submissionStatus,
+          submission_attempted_at: attemptedAt,
+          submission_error: submissionResult.reason,
+          submission_source: submissionResult.source,
+          ...cancellationMetadata,
+        })
+        .eq("id", claim.id)
+        .eq("user_id", claim.user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Save cancellation adapter checkpoint"
+    );
+
+    if (blockUpdateError) {
+      throw blockUpdateError;
+    }
+
+    return {
+      success: true,
+      blocked: true,
+      ready: submissionResult.ready === true,
+      message:
+        submissionResult.customer_message || submissionResult.reason,
+      customer_message:
+        submissionResult.customer_message || submissionResult.reason,
+      customer_title:
+        submissionResult.customer_title ||
+        "Cancellation compensation case ready",
+      customer_next_step:
+        submissionResult.customer_next_step ||
+        "No further action is needed right now.",
+      customer_status: submissionStatus,
+      claim: readyClaim,
+      submission: {
+        ...submissionResult,
+        operator_submission_audit: operatorSubmissionAudit,
+      },
+      operator_submission_audit: operatorSubmissionAudit,
+    };
+  }
+
+  const { data: submittedClaim, error: submissionUpdateError } =
+    await withTimeout(
+      supabaseAdmin
+        .from("claims")
+        .update({
+          status: "submitted",
+          submitted_at:
+            submissionResult.submittedAt || new Date().toISOString(),
+          operator_reference: submissionResult.operatorReference,
+          submission_status: "submitted",
+          submission_attempted_at: attemptedAt,
+          submission_error: null,
+          submission_source: submissionResult.source,
+          ...cancellationMetadata,
+        })
+        .eq("id", claim.id)
+        .eq("user_id", claim.user_id)
+        .select("*")
+        .single(),
+      10000,
+      "Complete cancellation compensation submission"
+    );
+
+  if (submissionUpdateError) {
+    throw submissionUpdateError;
+  }
+
+  const outcomeJob = await queueAutomationJob({
+    userId: submittedClaim.user_id,
+    claimId: submittedClaim.id,
+    jobType: "claim_check_outcome",
+  });
+
+  return {
+    success: true,
+    blocked: false,
+    ready: true,
+    submitted: true,
+    message: "Cancellation compensation case submitted automatically.",
+    claim: submittedClaim,
+    submission: submissionResult,
+    operator_submission_audit: operatorSubmissionAudit,
+    next_job: outcomeJob,
+  };
+}
+
 async function processClaimSubmitJob(job) {
   const { data: claim, error: claimError } = await withTimeout(
     supabaseAdmin
@@ -1753,22 +2025,19 @@ async function processClaimSubmitJob(job) {
     };
   }
 
-  if (
-    claim.claim_type === "cancellation_compensation" ||
-    claim.claim_type === "cancellation_refund"
-  ) {
+  if (claim.claim_type === "cancellation_refund") {
     return {
       success: true,
       blocked: true,
       ready: true,
       message:
-        "This cancelled and abandoned journey has been routed safely and cannot be sent through the ordinary Delay Repay adapter.",
+        "This unused-ticket refund must be handled by the original ticket retailer and cannot be sent through a train operator adapter.",
       customer_status: claim.submission_status,
-      customer_title: "Cancelled journey recorded",
+      customer_title: "Ticket refund route selected",
       customer_message:
-        "Delai has recorded your abandoned cancellation and selected the correct compensation route.",
+        "Delai has recorded your abandoned cancellation and selected the original-retailer refund route.",
       customer_next_step:
-        "No ordinary Delay Repay submission will be attempted. Delai will continue once the cancellation route adapter is connected.",
+        "No ordinary Delay Repay submission will be attempted. Delai will continue once the retailer refund adapter is connected.",
       claim,
     };
   }
@@ -1810,6 +2079,30 @@ async function processClaimSubmitJob(job) {
 
   if (!detectedDelay) {
     throw new Error("Linked detected delay not found for submission.");
+  }
+
+  if (claim.claim_type === "cancellation_compensation") {
+    return processCancellationCompensationSubmitJob({
+      claim,
+      detectedDelay,
+    });
+  }
+
+  if (isCancelledService(detectedDelay.service_status)) {
+    return {
+      success: true,
+      blocked: true,
+      ready: false,
+      message:
+        "This cancelled journey cannot be submitted through the ordinary Delay Repay adapter.",
+      customer_status: "manual_review_required",
+      customer_title: "Cancellation route needs review",
+      customer_message:
+        "Delai has blocked an incorrect ordinary Delay Repay submission for this cancelled journey.",
+      customer_next_step:
+        "The cancellation route must be corrected before automation can continue.",
+      claim,
+    };
   }
 
   if (detectedDelay.passenger_confirmation_status !== "confirmed") {
@@ -4405,21 +4698,56 @@ app.post("/validate-claim-submission", requireAuthenticatedUser, async (req, res
       });
     }
 
-    if (
-      isCancelledService(detectedDelay.service_status) ||
-      claim.claim_type === "cancellation_compensation" ||
-      claim.claim_type === "cancellation_refund"
-    ) {
+    if (claim.claim_type === "cancellation_refund") {
       return res.json({
         success: true,
         ready_for_submission: false,
         blocked: true,
         customer_status:
-          claim.submission_status || "awaiting_cancellation_adapter",
+          claim.submission_status || "awaiting_retailer_refund_adapter",
         message:
-          "This cancelled journey cannot use the ordinary Delay Repay submission adapter.",
+          "This unused-ticket refund must be handled by the original retailer.",
         compensation_route:
           claim.compensation_route || detectedDelay.compensation_route || null,
+        claim: buildSafeClaimResponse(claim),
+      });
+    }
+
+    if (claim.claim_type === "cancellation_compensation") {
+      const cancellationContext = await loadClaimSubmissionContext({
+        claim,
+        detectedDelay,
+      });
+      const cancellationValidation =
+        validateCancellationSubmissionContext(cancellationContext);
+
+      return res.json({
+        success: true,
+        ready_for_submission: false,
+        ready_for_cancellation_adapter:
+          cancellationValidation.readyForSubmission,
+        blocked: true,
+        customer_status: cancellationValidation.readyForSubmission
+          ? "cancellation_adapter_ready"
+          : "awaiting_information",
+        message: cancellationValidation.readyForSubmission
+          ? "The cancelled-journey compensation case is ready for the dedicated operator adapter. Final external dispatch remains safety locked."
+          : "More information is required before Delai can prepare the cancelled-journey compensation case.",
+        compensation_route:
+          claim.compensation_route || detectedDelay.compensation_route || null,
+        claim: buildSafeClaimResponse(claim),
+        validation: buildValidationResponse(cancellationValidation),
+      });
+    }
+
+    if (isCancelledService(detectedDelay.service_status)) {
+      return res.json({
+        success: true,
+        ready_for_submission: false,
+        blocked: true,
+        customer_status: "manual_review_required",
+        message:
+          "This cancelled service is not on a valid cancellation compensation route and cannot use ordinary Delay Repay.",
         claim: buildSafeClaimResponse(claim),
       });
     }
@@ -4546,22 +4874,61 @@ app.post("/submit-claim-with-delai", requireAuthenticatedUser, async (req, res) 
       });
     }
 
-    if (
-      isCancelledService(detectedDelay.service_status) ||
-      claim.claim_type === "cancellation_compensation" ||
-      claim.claim_type === "cancellation_refund"
-    ) {
+    if (claim.claim_type === "cancellation_refund") {
       return res.status(409).json({
         success: false,
         ready: false,
         blocked: true,
         customer_status:
-          claim.submission_status || "awaiting_cancellation_adapter",
-        customer_title: "Cancelled journey recorded",
+          claim.submission_status || "awaiting_retailer_refund_adapter",
+        customer_title: "Ticket refund route selected",
         customer_message:
-          "This abandoned cancellation has been routed safely and cannot be submitted through the ordinary Delay Repay adapter.",
+          "This unused-ticket refund must be handled by the original ticket retailer and cannot use an operator compensation adapter.",
         compensation_route:
           claim.compensation_route || detectedDelay.compensation_route || null,
+        claim: buildSafeClaimResponse(claim),
+      });
+    }
+
+    if (claim.claim_type === "cancellation_compensation") {
+      const cancellationResult = await processClaimSubmitJob({
+        id: `direct-cancellation-submit-${claim_id}`,
+        user_id,
+        claim_id,
+        job_type: "claim_submit",
+      });
+
+      return res.status(cancellationResult.ready ? 200 : 400).json({
+        success: cancellationResult.ready === true,
+        ready: cancellationResult.ready === true,
+        submitted: cancellationResult.submitted === true,
+        blocked: cancellationResult.blocked === true,
+        message: cancellationResult.message,
+        customer_status: cancellationResult.customer_status,
+        customer_title: cancellationResult.customer_title,
+        customer_message: cancellationResult.customer_message,
+        customer_next_step: cancellationResult.customer_next_step,
+        compensation_route:
+          claim.compensation_route || detectedDelay.compensation_route || null,
+        claim: buildSafeClaimResponse(
+          cancellationResult.claim || claim
+        ),
+        submission: buildSafeSubmissionResponse(cancellationResult),
+        validation: cancellationResult.validation,
+        blocking_issues: cancellationResult.blocking_issues,
+        missing_fields: cancellationResult.missing_fields,
+      });
+    }
+
+    if (isCancelledService(detectedDelay.service_status)) {
+      return res.status(409).json({
+        success: false,
+        ready: false,
+        blocked: true,
+        customer_status: "manual_review_required",
+        customer_title: "Cancellation route needs review",
+        customer_message:
+          "This cancelled service is not marked as a cancellation compensation case and cannot use ordinary Delay Repay.",
         claim: buildSafeClaimResponse(claim),
       });
     }

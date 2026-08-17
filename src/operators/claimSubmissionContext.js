@@ -60,7 +60,7 @@ function buildClaimSubmissionContext({
   const operatorIdentity = resolveOperatorIdentity(rawOperatorName);
 
   return {
-    contextVersion: "1.3-payments",
+    contextVersion: "1.4-cancellations",
     generatedAt: new Date().toISOString(),
 
     claim: {
@@ -72,6 +72,9 @@ function buildClaimSubmissionContext({
       preparedAt: claim.prepared_at || null,
       submissionStatus: claim.submission_status || null,
       existingOperatorReference: cleanText(claim.operator_reference),
+      claimType: cleanText(claim.claim_type) || "delay_repay",
+      compensationRoute: cleanText(claim.compensation_route),
+      journeyOutcome: cleanText(claim.journey_outcome),
     },
 
     operator: {
@@ -139,7 +142,10 @@ function buildClaimSubmissionContext({
 
     journey: {
       delayId: detectedDelay.id,
-      date: detectedDelay.delay_date || null,
+      serviceIdentifier: cleanText(detectedDelay.service_identifier),
+      serviceStatus: cleanText(detectedDelay.service_status) || "delayed",
+      date:
+        detectedDelay.service_date || detectedDelay.delay_date || null,
       operator: cleanText(rawOperatorName),
       originStation:
         cleanText(detectedDelay.origin_station) ||
@@ -149,10 +155,28 @@ function buildClaimSubmissionContext({
         cleanText(commute?.destination_station),
       direction: cleanText(detectedDelay.direction),
       travelWindow: cleanText(detectedDelay.travel_window),
-      scheduledTime: cleanText(detectedDelay.scheduled_time),
-      actualTime: cleanText(detectedDelay.actual_time),
+      scheduledTime:
+        cleanText(detectedDelay.scheduled_departure_time) ||
+        cleanText(detectedDelay.scheduled_time),
+      scheduledArrivalTime: cleanText(
+        detectedDelay.scheduled_arrival_time
+      ),
+      actualTime:
+        cleanText(detectedDelay.actual_departure_time) ||
+        cleanText(detectedDelay.actual_time),
+      actualArrivalTime: cleanText(detectedDelay.actual_arrival_time),
       delayMinutes: cleanNumber(detectedDelay.delay_minutes),
       source: cleanText(detectedDelay.source),
+      passengerConfirmationStatus: cleanText(
+        detectedDelay.passenger_confirmation_status
+      ),
+      journeyOutcome:
+        cleanText(detectedDelay.journey_outcome) ||
+        cleanText(claim.journey_outcome),
+      compensationRoute:
+        cleanText(detectedDelay.compensation_route) ||
+        cleanText(claim.compensation_route),
+      disruptionReason: cleanText(detectedDelay.disruption_reason),
     },
 
     ticket: {
