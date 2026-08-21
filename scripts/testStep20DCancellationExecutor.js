@@ -18,9 +18,11 @@ for (const name of [
   "ENABLE_GREATER_ANGLIA_CANCELLATION_SUBMISSION",
   "GREATER_ANGLIA_CANCELLATION_FINAL_SUBMIT_ENABLED",
   "GREATER_ANGLIA_CANCELLATION_PLAYWRIGHT_ENABLED",
+  "GREATER_ANGLIA_CANCELLATION_BEST_TIME_TO_CALL",
 ]) {
   delete process.env[name];
 }
+process.env.GREATER_ANGLIA_CANCELLATION_BEST_TIME_TO_CALL = "PM";
 
 const submissionContext = {
   contextVersion: "1.4-cancellations",
@@ -113,6 +115,7 @@ assert.equal(draft.lastName, "Passenger");
 assert.equal(draft.journeyDate, "2026-08-20");
 assert.equal(draft.journeyTime, "08:07");
 assert.equal(draft.ticketCost, "5000.00");
+assert.equal(draft.bestTimeToCall, "PM");
 assert.equal(draft.marketingConsent, false);
 assert.equal(draft.regulatorResearchConsent, false);
 
@@ -249,6 +252,12 @@ assert.match(
 );
 assert.doesNotMatch(executorSource, /clickFinalSubmit/);
 assert.match(executorSource, /Step 20D did not and cannot press Submit/);
+assert.match(executorSource, /input\[autocomplete="postal-code"\]/);
+assert.match(executorSource, /selectBestTimeToCall/);
+assert.match(executorSource, /GREATER_ANGLIA_CANCELLATION_BEST_TIME_TO_CALL/);
+assert.match(executorSource, /checkScopedRadioChoice/);
+assert.match(executorSource, /Decline marketing communications/);
+assert.match(executorSource, /Decline regulator research contact/);
 
 const serverSource = readFileSync(
   new URL("../src/server.js", import.meta.url),

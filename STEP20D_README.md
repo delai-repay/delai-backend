@@ -1,5 +1,24 @@
 # Delai Step 20D — Greater Anglia Cancellation Form Draft Executor
 
+## 2026-08-21 live-form compatibility hotfix
+
+- Updates the executor audit version to
+  `greater-anglia-cancellation-draft-1.0.2`.
+- Locates the visible Greater Anglia postcode control using its label, postal
+  autocomplete attribute, and current name/id variants.
+- Skips hidden duplicate controls instead of assuming the first matching
+  element is visible.
+- Handles the current required “Best time to call” selector using an explicit
+  passenger `AM` or `PM` preference. For the controlled local test only, set
+  `GREATER_ANGLIA_CANCELLATION_BEST_TIME_TO_CALL=PM`; a later profile change
+  should persist this per passenger.
+- Selects the privacy-preserving “No thank you” marketing option and “No”
+  regulator-research option using their scoped live radio groups.
+- Treats Ticket Cost as an optional live-form control because it is not
+  displayed for every Customer Relations contact reason.
+- Keeps `CANCELLATION_FINAL_SUBMIT_IMPLEMENTED = false`; no final Submit action
+  has been added.
+
 Step 20D extends the verified Step 20C cancellation adapter with a protected
 Playwright executor for Greater Anglia's Customer Relations form.
 

@@ -2,7 +2,7 @@ import path from "node:path";
 import { mkdir } from "node:fs/promises";
 
 const DEFAULT_TIMEOUT_MS = 45000;
-const EXECUTOR_VERSION = "greater-anglia-cancellation-draft-1.0";
+const EXECUTOR_VERSION = "greater-anglia-cancellation-draft-1.0.2";
 const CANCELLATION_FINAL_SUBMIT_IMPLEMENTED = false;
 
 function cleanText(value) {
@@ -66,6 +66,11 @@ function exactTime(value) {
 function money(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed.toFixed(2) : null;
+}
+
+function callTimePreference(value) {
+  const preference = cleanText(value)?.toUpperCase();
+  return preference === "AM" || preference === "PM" ? preference : null;
 }
 
 function buildGreaterAngliaCancellationQuestion(mappedSubmission = {}) {
@@ -137,6 +142,11 @@ function buildGreaterAngliaCancellationFormDraft(mappedSubmission = {}) {
       "Greater Anglia",
     question: buildGreaterAngliaCancellationQuestion(mappedSubmission),
     contactNumber: cleanText(passenger.mobile),
+    bestTimeToCall: callTimePreference(
+      passenger.bestTimeToCall ||
+        passenger.preferredCallTime ||
+        process.env.GREATER_ANGLIA_CANCELLATION_BEST_TIME_TO_CALL
+    ),
     marketingConsent: false,
     regulatorResearchConsent: false,
   };
@@ -159,6 +169,7 @@ function validateGreaterAngliaCancellationDraftPreflight(mappedSubmission = {}) 
     ["ticketCost", "ticket cost"],
     ["ticketPurchasedFrom", "ticket purchased from"],
     ["question", "customer question"],
+    ["bestTimeToCall", "passenger best time to call (AM or PM)"],
   ];
   const missingFields = required
     .filter(([key]) => !draft[key])
@@ -288,6 +299,24 @@ function candidateLocators(page, labelRegex, selectors = []) {
   ];
 }
 
+async function firstVisibleLocator(locator) {
+  const count = await locator.count();
+
+  for (let index = 0; index < count; index += 1) {
+    const candidate = locator.nth(index);
+
+    try {
+      if (await candidate.isVisible()) {
+        return candidate;
+      }
+    } catch {
+      // Continue through defensive locator candidates.
+    }
+  }
+
+  return null;
+}
+
 async function fillField({
   page,
   runContext,
@@ -308,12 +337,23 @@ async function fillField({
 
   let lastError = null;
 
-  for (const candidate of candidateLocators(page, labelRegex, selectors)) {
+  const candidates = [
+    ...candidateLocators(page, labelRegex, selectors),
+    {
+      description: `input following label ${labelRegex}`,
+      locator: page
+        .locator("label")
+        .filter({ hasText: labelRegex })
+        .locator("xpath=following::input[1]"),
+    },
+  ];
+
+  for (const candidate of candidates) {
     try {
       if ((await candidate.locator.count()) === 0) continue;
 
-      const locator = candidate.locator.first();
-      await locator.waitFor({ state: "visible", timeout: 2500 });
+      const locator = await firstVisibleLocator(candidate.locator);
+      if (!locator) continue;
       await locator.fill(cleanValue);
       addStep(runContext, `Fill ${label}`, {
         selector: candidate.description,
@@ -333,6 +373,74 @@ async function fillField({
   }
 
   addWarning(runContext, `${label} was not filled because the field was unavailable.`);
+  return false;
+}
+
+async function selectBestTimeToCall(page, runContext, preference) {
+  const selectedPreference = callTimePreference(preference);
+
+  if (!selectedPreference) {
+    addWarning(
+      runContext,
+      "Best time to call must be supplied as AM or PM."
+    );
+    return false;
+  }
+
+  const candidates = candidateLocators(
+    page,
+    /Best time to call/i,
+    [
+      'select[name*="best" i][name*="time" i]',
+      'select[id*="best" i][id*="time" i]',
+      'select[name*="call" i][name*="time" i]',
+      'select[id*="call" i][id*="time" i]',
+    ]
+  );
+
+  for (const candidate of candidates) {
+    try {
+      const select = await firstVisibleLocator(candidate.locator);
+      if (!select) continue;
+
+      const options = await select.locator("option").evaluateAll((items) =>
+        items.map((item) => ({
+          label: String(item.textContent || "").replace(/\s+/g, " ").trim(),
+          value: item.value,
+          disabled: Boolean(item.disabled),
+        }))
+      );
+      const preferredOption = options.find(
+        (option) =>
+          option.value &&
+          !option.disabled &&
+          option.label.toUpperCase() === selectedPreference
+      );
+
+      if (!preferredOption) {
+        addWarning(
+          runContext,
+          "The passenger's AM or PM call preference was not available on the current form.",
+          { availableOptions: options.map((option) => option.label).filter(Boolean) }
+        );
+        return false;
+      }
+
+      await select.selectOption(preferredOption.value);
+      addStep(runContext, "Select passenger best time to call", {
+        selector: candidate.description,
+        selectedLabel: preferredOption.label,
+      });
+      return true;
+    } catch {
+      // Continue through defensive select locators.
+    }
+  }
+
+  addWarning(
+    runContext,
+    "Best time to call could not be located on the current Greater Anglia form."
+  );
   return false;
 }
 
@@ -390,56 +498,90 @@ async function selectContactReason(page, runContext, preferences) {
   );
 }
 
+async function checkScopedRadioChoice({
+  page,
+  runContext,
+  groupRegex,
+  optionRegex,
+  stepName,
+}) {
+  const radios = page.locator('input[type="radio"]');
+  const count = await radios.count();
+
+  for (let index = 0; index < count; index += 1) {
+    const radio = radios.nth(index);
+
+    try {
+      if (!(await radio.isVisible())) continue;
+
+      const metadata = await radio.evaluate((element) => {
+        const explicitLabel = element.id
+          ? document.querySelector(`label[for="${CSS.escape(element.id)}"]`)
+          : null;
+        const closestLabel = element.closest("label");
+        const labelText = String(
+          explicitLabel?.textContent ||
+            closestLabel?.textContent ||
+            element.parentElement?.textContent ||
+            ""
+        )
+          .replace(/\s+/g, " ")
+          .trim();
+        const ancestorTexts = [];
+        let ancestor = element.parentElement;
+
+        while (ancestor && ancestor.tagName !== "FORM" && ancestorTexts.length < 8) {
+          ancestorTexts.push(
+            String(ancestor.textContent || "").replace(/\s+/g, " ").trim()
+          );
+          ancestor = ancestor.parentElement;
+        }
+
+        return { labelText, ancestorTexts };
+      });
+
+      if (!optionRegex.test(metadata.labelText)) continue;
+      if (!metadata.ancestorTexts.some((text) => groupRegex.test(text))) continue;
+
+      await radio.check();
+      addStep(runContext, stepName, { selectedLabel: metadata.labelText });
+      return true;
+    } catch {
+      // Continue through defensive radio candidates.
+    }
+  }
+
+  return false;
+}
+
 async function chooseNoConsent(page, runContext) {
-  const marketingCandidates = [
-    page.getByLabel(/^No thank you$/i),
-    page
-      .locator("fieldset")
-      .filter({ hasText: /email marketing communications/i })
-      .getByLabel(/^No/i),
-  ];
+  const marketingSelected = await checkScopedRadioChoice({
+    page,
+    runContext,
+    groupRegex: /email marketing communications/i,
+    optionRegex: /^No thank you$/i,
+    stepName: "Decline marketing communications",
+  });
 
-  for (const candidate of marketingCandidates) {
-    try {
-      if ((await candidate.count()) > 0) {
-        await candidate.first().check();
-        addStep(runContext, "Decline marketing communications");
-        break;
-      }
-    } catch {
-      // Marketing is optional; retain a warning below when no safe control exists.
-    }
+  if (!marketingSelected) {
+    addWarning(
+      runContext,
+      "The marketing opt-out control could not be selected safely."
+    );
   }
 
-  const researchCandidates = [
-    page
-      .locator("fieldset")
-      .filter({ hasText: /Office of Rail and Road|M\.E\.L\. Research/i })
-      .getByLabel(/^No$/i),
-    page
-      .locator("fieldset")
-      .filter({ hasText: /consent to being contacted/i })
-      .getByLabel(/^No$/i),
-  ];
-
-  let researchSelected = false;
-  for (const candidate of researchCandidates) {
-    try {
-      if ((await candidate.count()) > 0) {
-        await candidate.first().check();
-        addStep(runContext, "Decline regulator research contact");
-        researchSelected = true;
-        break;
-      }
-    } catch {
-      // Continue through scoped research consent locators.
-    }
-  }
+  const researchSelected = await checkScopedRadioChoice({
+    page,
+    runContext,
+    groupRegex: /Office of Rail and Road|M\.E\.L\. Research|complaint handling/i,
+    optionRegex: /^No$/i,
+    stepName: "Decline regulator research contact",
+  });
 
   if (!researchSelected) {
     addWarning(
       runContext,
-      "The optional regulator research consent control could not be selected safely."
+      "The regulator research opt-out control could not be selected safely."
     );
   }
 }
@@ -559,14 +701,38 @@ async function fillCancellationDraft(page, runContext, draft) {
     ["address line 2", draft.addressLine2, /Address line 2/i, ['input[name*="address.*2" i]'], false],
     ["town or city", draft.townCity, /Town\s*\/\s*City/i, ['input[name*="town" i]', 'input[name*="city" i]'], true],
     ["county", draft.county, /^County/i, ['input[name*="county" i]'], false],
-    ["postcode", draft.postcode, /^Postcode/i, ['input[name*="postcode" i]'], true],
+    [
+      "postcode",
+      draft.postcode,
+      /Post\s*code/i,
+      [
+        'input[autocomplete="postal-code"]',
+        'input[name*="postcode" i]',
+        'input[name*="post_code" i]',
+        'input[name*="postal" i]',
+        'input[id*="postcode" i]',
+        'input[id*="post-code" i]',
+        'input[id*="post_code" i]',
+        'input[id*="postal" i]',
+      ],
+      true,
+    ],
     ["boarding station", draft.boardingStation, /Boarding Station/i, ['input[name*="boarding" i]'], true],
     ["destination station", draft.destinationStation, /Destination Station/i, ['input[name*="destination" i]'], true],
     ["train headcode", draft.trainHeadcode, /Coach Number.*Train Headcode/i, ['input[name*="headcode" i]'], false],
     ["journey date", draft.journeyDate, /Date of Journey/i, ['input[type="date"]'], true],
     ["journey time", draft.journeyTime, /Time of Journey/i, ['input[type="time"]'], true],
     ["ticket type", draft.ticketType, /Ticket Type/i, ['input[name*="ticket.*type" i]'], true],
-    ["ticket cost", draft.ticketCost, /Ticket Cost/i, ['input[name*="ticket.*cost" i]'], true],
+    [
+      "ticket cost",
+      draft.ticketCost,
+      /Ticket Cost/i,
+      [
+        'input[name*="ticket" i][name*="cost" i]',
+        'input[id*="ticket" i][id*="cost" i]',
+      ],
+      false,
+    ],
     ["booking reference", draft.bookingReference, /Booking Reference/i, ['input[name*="booking" i]'], false],
     ["ticket purchased from", draft.ticketPurchasedFrom, /Ticket purchased from/i, ['input[name*="purchased" i]'], true],
     ["question", draft.question, /^Your question/i, ["textarea"], true],
@@ -585,6 +751,7 @@ async function fillCancellationDraft(page, runContext, draft) {
     });
   }
 
+  await selectBestTimeToCall(page, runContext, draft.bestTimeToCall);
   await chooseNoConsent(page, runContext);
 }
 
