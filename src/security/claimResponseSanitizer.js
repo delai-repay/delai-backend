@@ -30,6 +30,22 @@ function buildSafeClaimResponse(claim = {}) {
       claim.cancellation_submission_channel,
       120
     ),
+    cancellation_executor_key: cleanString(
+      claim.cancellation_executor_key,
+      120
+    ),
+    cancellation_executor_version: cleanString(
+      claim.cancellation_executor_version,
+      120
+    ),
+    cancellation_executor_checkpoint: cleanString(
+      claim.cancellation_executor_checkpoint,
+      120
+    ),
+    cancellation_form_draft_prepared_at: cleanString(
+      claim.cancellation_form_draft_prepared_at,
+      40
+    ),
     submitted_at: cleanString(claim.submitted_at, 40),
     operator_reference: cleanString(claim.operator_reference, 120),
     outcome: cleanString(claim.outcome, 60),
@@ -83,6 +99,10 @@ function buildSafeSubmissionResponse(result = {}) {
     ),
     submission_channel: cleanString(
       source?.submissionChannel || source?.submission_channel,
+      120
+    ),
+    executor_version: cleanString(
+      source?.executorVersion || source?.executor_version,
       120
     ),
     final_submit_enabled: source?.finalSubmitEnabled === true,

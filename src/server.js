@@ -1892,6 +1892,12 @@ async function processCancellationCompensationSubmitJob({
     completedAt: new Date().toISOString(),
   });
 
+  const cancellationExecutorAttempted = Boolean(
+    submissionResult.runContext ||
+      submissionResult.checkpoint ||
+      submissionResult.draftPreparedAt
+  );
+
   const cancellationMetadata = {
     cancellation_adapter_key:
       submissionResult.operatorKey || submissionContext.operator?.key || null,
@@ -1900,6 +1906,20 @@ async function processCancellationCompensationSubmitJob({
     cancellation_case_prepared_at: new Date().toISOString(),
     cancellation_submission_channel:
       submissionResult.submissionChannel || null,
+    cancellation_executor_key:
+      cancellationExecutorAttempted
+        ? "greater_anglia_customer_relations_playwright"
+        : null,
+    cancellation_executor_version:
+      cancellationExecutorAttempted
+        ? submissionResult.executorVersion || null
+        : null,
+    cancellation_executor_checkpoint:
+      submissionResult.checkpoint ||
+      submissionResult.runContext?.checkpoint ||
+      null,
+    cancellation_form_draft_prepared_at:
+      submissionResult.draftPreparedAt || null,
   };
 
   if (!submissionResult.submitted) {

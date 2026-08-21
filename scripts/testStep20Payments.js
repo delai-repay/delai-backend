@@ -28,6 +28,10 @@ assert.deepEqual(Object.keys(safeClaim), [
   "cancellation_policy_version",
   "cancellation_case_prepared_at",
   "cancellation_submission_channel",
+  "cancellation_executor_key",
+  "cancellation_executor_version",
+  "cancellation_executor_checkpoint",
+  "cancellation_form_draft_prepared_at",
   "submitted_at",
   "operator_reference",
   "outcome",
@@ -73,6 +77,7 @@ const safeSubmission = buildSafeSubmissionResponse(sensitiveSubmission);
 assert.equal(safeSubmission.checkpoint, "final_review");
 assert.equal(safeSubmission.blocker_code, "final_submit_safety_lock");
 assert.equal(safeSubmission.final_submit_enabled, false);
+assert.equal(safeSubmission.executor_version, null);
 assert.equal(
   safeSubmission.operator_submission_audit.screenshot_count,
   6
