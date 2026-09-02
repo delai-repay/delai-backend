@@ -136,8 +136,9 @@ async function createMandateBillingRequestFlow({
 async function createFeePayment({
   mandateId,
   amountPence,
-  claimId,
-  feeTransactionId,
+  claimId = null,
+  feeTransactionId = null,
+  feeBatchId = null,
   idempotencyKey,
 }) {
   try {
@@ -148,13 +149,18 @@ async function createFeePayment({
         payments: {
           amount: amountPence,
           currency: "GBP",
-          description: "Delai 10% success fee",
+          description: feeBatchId
+            ? "Delai accumulated 10% success fees"
+            : "Delai 10% success fee",
           retry_if_possible:
             cleanText(process.env.GOCARDLESS_RETRY_IF_POSSIBLE).toLowerCase() ===
             "true",
           metadata: {
-            claim_id: claimId,
-            fee_transaction_id: feeTransactionId,
+            ...(claimId ? { claim_id: claimId } : {}),
+            ...(feeTransactionId
+              ? { fee_transaction_id: feeTransactionId }
+              : {}),
+            ...(feeBatchId ? { fee_batch_id: feeBatchId } : {}),
           },
           links: {
             mandate: mandateId,

@@ -27,10 +27,17 @@ import {
   storeGoCardlessWebhookEvents,
 } from "./payments/paymentAutomation.js";
 import { verifySignedWebhook } from "./payments/paymentCrypto.js";
+import { getFeeLedgerSummary } from "./payments/feeLedgerService.js";
 import {
   buildSafeClaimResponse,
   buildSafeSubmissionResponse,
 } from "./security/claimResponseSanitizer.js";
+import {
+  boundedText,
+  constantTimeTextEqual,
+  createRateLimiter,
+  requireClaimId,
+} from "./security/httpSecurity.js";
 import {
   getCancelledJourneyRoute,
   isCancelledService,
@@ -43,9 +50,11 @@ dotenv.config();
 
 const app = express();
 
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(
   express.json({
+    limit: "128kb",
     verify: (req, _res, buffer) => {
       if (req.originalUrl === "/payments/webhooks/gocardless") {
         req.rawBody = Buffer.from(buffer);
@@ -76,6 +85,29 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization", "x-cron-secret"],
   })
 );
+
+const apiRateLimiter = createRateLimiter({
+  windowMs: Number(process.env.API_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000),
+  max: Number(process.env.API_RATE_LIMIT_MAX || 300),
+  keyPrefix: "api",
+});
+const claimMutationRateLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.CLAIM_RATE_LIMIT_MAX || 120),
+  keyPrefix: "claim",
+});
+const paymentRateLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.PAYMENT_RATE_LIMIT_MAX || 40),
+  keyPrefix: "payment",
+});
+const earlyAccessRateLimiter = createRateLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: Number(process.env.EARLY_ACCESS_RATE_LIMIT_MAX || 10),
+  keyPrefix: "early-access",
+});
+
+app.use(apiRateLimiter);
 
 const FINAL_CLAIM_OUTCOMES = ["paid", "rejected", "needs_follow_up"];
 
@@ -134,6 +166,18 @@ async function requireAuthenticatedUser(req, res, next) {
     }
 
     req.authUser = data.user;
+    req.authenticatedUser = data.user;
+
+    if (req.body && typeof req.body === "object" && !Array.isArray(req.body)) {
+      if (req.body.user_id && req.body.user_id !== data.user.id) {
+        return res.status(403).json({
+          success: false,
+          error: "The requested user does not match the authenticated session.",
+        });
+      }
+      req.body.user_id = data.user.id;
+    }
+
     return next();
   } catch (error) {
     console.error("Authentication check failed:", error.message);
@@ -149,17 +193,13 @@ function requireAutomationSecret(req, res, next) {
   const suppliedSecret = String(req.headers["x-cron-secret"] || "");
 
   if (!configuredSecret) {
-    if (process.env.NODE_ENV === "production") {
-      return res.status(503).json({
-        success: false,
-        error: "Automation security is not configured.",
-      });
-    }
-
-    return next();
+    return res.status(503).json({
+      success: false,
+      error: "Automation security is not configured.",
+    });
   }
 
-  if (suppliedSecret !== configuredSecret) {
+  if (!constantTimeTextEqual(suppliedSecret, configuredSecret)) {
     return res.status(401).json({
       success: false,
       error: "Unauthorized automation request.",
@@ -2388,6 +2428,13 @@ async function queueAutomationJob({
   );
 
   if (error) {
+    if (error.code === "23505") {
+      return {
+        skipped: true,
+        reason: "existing_job_race",
+        job: null,
+      };
+    }
     throw error;
   }
 
@@ -2405,6 +2452,9 @@ async function completeAutomationJob(jobId) {
         status: "completed",
         completed_at: new Date().toISOString(),
         last_error: null,
+        locked_at: null,
+        locked_by: null,
+        lease_expires_at: null,
       })
       .eq("id", jobId),
     10000,
@@ -2423,6 +2473,9 @@ async function blockAutomationJob(jobId, reason) {
       .update({
         status: "blocked",
         last_error: reason || "Automation job is blocked.",
+        locked_at: null,
+        locked_by: null,
+        lease_expires_at: null,
       })
       .eq("id", jobId),
     10000,
@@ -2435,19 +2488,22 @@ async function blockAutomationJob(jobId, reason) {
 }
 
 async function failAutomationJob(job, error) {
-  const nextAttempts = Number(job.attempts || 0) + 1;
-  const shouldFail = nextAttempts >= AUTOMATION_RETRY_LIMIT;
+  const attempts = Number(job.attempts || 0);
+  const shouldFail = attempts >= AUTOMATION_RETRY_LIMIT;
 
   const { error: updateError } = await withTimeout(
     supabaseAdmin
       .from("automation_jobs")
       .update({
         status: shouldFail ? "failed" : "retry",
-        attempts: nextAttempts,
+        attempts,
         last_error: error.message || "Unknown automation error",
         run_after: shouldFail
           ? job.run_after
           : getFutureIsoDate({ minutes: 20 }),
+        locked_at: null,
+        locked_by: null,
+        lease_expires_at: null,
       })
       .eq("id", job.id),
     10000,
@@ -2693,7 +2749,7 @@ async function processClaimCheckPaymentJob(job) {
 
   const payment = calculateClaimPayment({
     compensationAmount: extractedAmount,
-    feePercentage: claim.fee_percentage || 10,
+    feePercentage: 10,
   });
 
   const now = new Date().toISOString();
@@ -2804,7 +2860,13 @@ async function processClaimCollectFeeJob(job) {
 
   const collectionResult = await collectFeeForClaim(claim);
 
-  if (collectionResult?.blocked) {
+  if (
+    collectionResult?.blocked &&
+    [
+      "direct_debit_mandate_required",
+      "direct_debit_mandate_not_active",
+    ].includes(collectionResult.code)
+  ) {
     await createClaimNotification({
       userId: claim.user_id,
       claimId: claim.id,
@@ -2862,16 +2924,15 @@ async function processAutomationJobs({ limit = 20 }) {
     limit: safeLimit,
   });
 
+  const workerId = `${process.env.RENDER_INSTANCE_ID || "local"}:${process.pid}`;
   const { data: jobs, error: jobsError } = await withTimeout(
-    supabaseAdmin
-      .from("automation_jobs")
-      .select("*")
-      .in("status", ["queued", "retry"])
-      .lte("run_after", new Date().toISOString())
-      .order("run_after", { ascending: true })
-      .limit(safeLimit),
+    supabaseAdmin.rpc("lease_automation_jobs", {
+      p_limit: safeLimit,
+      p_worker_id: workerId,
+      p_lease_seconds: Number(process.env.AUTOMATION_JOB_LEASE_SECONDS || 300),
+    }),
     15000,
-    "Automation jobs lookup"
+    "Atomic automation job lease"
   );
 
   if (jobsError) {
@@ -2885,27 +2946,7 @@ async function processAutomationJobs({ limit = 20 }) {
 
   for (const job of jobs || []) {
     try {
-      const nextAttempts = Number(job.attempts || 0) + 1;
-
-      const { data: processingJob, error: processingError } = await withTimeout(
-        supabaseAdmin
-          .from("automation_jobs")
-          .update({
-            status: "processing",
-            attempts: nextAttempts,
-            last_error: null,
-          })
-          .eq("id", job.id)
-          .select("*")
-          .single(),
-        10000,
-        "Mark automation job processing"
-      );
-
-      if (processingError) {
-        throw processingError;
-      }
-
+      const processingJob = job;
       const result = await processAutomationJob(processingJob);
 
       if (result?.blocked) {
@@ -2991,7 +3032,7 @@ app.get("/operators", (req, res) => {
   });
 });
 
-app.get("/supabase-health", async (req, res) => {
+app.get("/supabase-health", requireAutomationSecret, async (req, res) => {
   try {
     console.log("Supabase health check started");
 
@@ -3032,7 +3073,7 @@ app.get("/supabase-health", async (req, res) => {
   }
 });
 
-app.get("/detect-delays-test", async (req, res) => {
+app.get("/detect-delays-test", requireAutomationSecret, async (req, res) => {
   try {
     const { data: commutes, error: commuteError } = await withTimeout(
       supabaseAdmin.from("commutes").select("*"),
@@ -4072,7 +4113,7 @@ app.post("/detect-delays", requireAutomationSecret, async (req, res) => {
 });
 
 
-app.get("/pending-delay-confirmations", requireAuthenticatedUser, async (req, res) => {
+app.get("/pending-delay-confirmations", requireAuthenticatedUser, claimMutationRateLimiter, async (req, res) => {
   try {
     const userId = req.authUser.id;
 
@@ -4215,7 +4256,7 @@ app.get("/pending-delay-confirmations", requireAuthenticatedUser, async (req, re
   }
 });
 
-app.post("/respond-delay-confirmation", requireAuthenticatedUser, async (req, res) => {
+app.post("/respond-delay-confirmation", requireAuthenticatedUser, claimMutationRateLimiter, async (req, res) => {
   try {
     const userId = req.authUser.id;
     const detectedDelayId = String(req.body?.detected_delay_id || "").trim();
@@ -4465,7 +4506,7 @@ app.post("/respond-delay-confirmation", requireAuthenticatedUser, async (req, re
   }
 });
 
-app.post("/prepare-claim", async (req, res) => {
+app.post("/prepare-claim", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
     const { user_id, claim_id } = req.body;
 
@@ -4654,7 +4695,7 @@ Suggested next action:
     });
   }
 });
-app.post("/validate-claim-submission", requireAuthenticatedUser, async (req, res) => {
+app.post("/validate-claim-submission", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
     const { claim_id } = req.body || {};
     const user_id = req.authUser.id;
@@ -4814,7 +4855,7 @@ app.post("/validate-claim-submission", requireAuthenticatedUser, async (req, res
 });
 
 
-app.post("/submit-claim-with-delai", requireAuthenticatedUser, async (req, res) => {
+app.post("/submit-claim-with-delai", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
     const { claim_id } = req.body || {};
     const user_id = req.authUser.id;
@@ -5125,7 +5166,7 @@ app.post("/submit-claim-with-delai", requireAuthenticatedUser, async (req, res) 
   }
 });
 
-app.post("/mark-claim-ready", async (req, res) => {
+app.post("/mark-claim-ready", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
     const { user_id, claim_id } = req.body;
 
@@ -5195,7 +5236,7 @@ app.post("/mark-claim-ready", async (req, res) => {
   }
 });
 
-app.post("/mark-claim-submitted", async (req, res) => {
+app.post("/mark-claim-submitted", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
     const { user_id, claim_id } = req.body;
 
@@ -5274,8 +5315,10 @@ app.post("/mark-claim-submitted", async (req, res) => {
       message:
         submissionResult.message ||
         "Delai has started the claim submission process.",
-      claim: submissionResult.claim || latestClaim || claim,
-      submission: submissionResult.submission || submissionResult,
+      claim: buildSafeClaimResponse(
+        submissionResult.claim || latestClaim || claim
+      ),
+      submission: buildSafeSubmissionResponse(submissionResult),
       automation_job: submissionResult.next_job || null,
     });
   } catch (error) {
@@ -5289,10 +5332,8 @@ app.post("/mark-claim-submitted", async (req, res) => {
   }
 });
 
-app.post("/update-claim-reference", async (req, res) => {
+app.post("/update-claim-reference", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
-    console.log("Update claim reference request received:", req.body);
-
     const { user_id, claim_id, operator_reference } = req.body;
 
     if (!user_id || !claim_id) {
@@ -5302,14 +5343,17 @@ app.post("/update-claim-reference", async (req, res) => {
       });
     }
 
-    if (!operator_reference || !operator_reference.trim()) {
+    const cleanReference = boundedText(operator_reference, {
+      max: 200,
+      allowEmpty: false,
+    });
+
+    if (!cleanReference) {
       return res.status(400).json({
         success: false,
-        error: "Missing operator reference",
+        error: "Operator reference is required and must be 200 characters or fewer.",
       });
     }
-
-    const cleanReference = operator_reference.trim();
 
     const { data: claim, error: claimError } = await withTimeout(
       supabaseAdmin
@@ -5403,7 +5447,7 @@ app.post("/update-claim-reference", async (req, res) => {
   }
 });
 
-app.post("/update-operator-response", async (req, res) => {
+app.post("/update-operator-response", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
     const { user_id, claim_id, operator_response, outcome_notes } = req.body;
 
@@ -5414,8 +5458,17 @@ app.post("/update-operator-response", async (req, res) => {
       });
     }
 
-    const cleanOperatorResponse = operator_response?.trim() || "";
-    const cleanOutcomeNotes = outcome_notes?.trim() || "";
+    const cleanOperatorResponse = boundedText(operator_response, {
+      max: 20000,
+    });
+    const cleanOutcomeNotes = boundedText(outcome_notes, { max: 5000 });
+
+    if (cleanOperatorResponse === null || cleanOutcomeNotes === null) {
+      return res.status(400).json({
+        success: false,
+        error: "Operator response or outcome note is too long.",
+      });
+    }
 
     if (!cleanOperatorResponse && !cleanOutcomeNotes) {
       return res.status(400).json({
@@ -5514,7 +5567,7 @@ app.post("/update-operator-response", async (req, res) => {
   }
 });
 
-app.post("/update-claim-outcome", async (req, res) => {
+app.post("/update-claim-outcome", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
     const { user_id, claim_id, outcome } = req.body;
 
@@ -5629,10 +5682,8 @@ app.post("/update-claim-outcome", async (req, res) => {
   }
 });
 
-app.post("/check-claim-outcome", async (req, res) => {
+app.post("/check-claim-outcome", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
-    console.log("Check claim outcome request received:", req.body);
-
     const { user_id, claim_id } = req.body;
 
     if (!user_id || !claim_id) {
@@ -5751,22 +5802,17 @@ async function checkSubmittedClaims({ limit }) {
 
 async function checkSubmittedClaimsHandler(req, res) {
   try {
-    const cronSecret = req.headers["x-cron-secret"];
-
-    if (process.env.CRON_SECRET && cronSecret !== process.env.CRON_SECRET) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized cron request",
-      });
-    }
-
     const limit = req.body?.limit || req.query?.limit || 20;
 
-    const result = await checkSubmittedClaims({
+    const result = await queueSubmittedClaimOutcomeJobs({
       limit,
     });
 
-    return res.json(result);
+    return res.json({
+      success: true,
+      message: "Submitted claims were queued for the atomic automation worker.",
+      ...result,
+    });
   } catch (error) {
     console.error("Check submitted claims error:", error);
 
@@ -5778,20 +5824,14 @@ async function checkSubmittedClaimsHandler(req, res) {
   }
 }
 
-app.post("/check-submitted-claims", checkSubmittedClaimsHandler);
-app.get("/check-submitted-claims", checkSubmittedClaimsHandler);
+app.post(
+  "/check-submitted-claims",
+  requireAutomationSecret,
+  checkSubmittedClaimsHandler
+);
 
 async function processAutomationJobsHandler(req, res) {
   try {
-    const cronSecret = req.headers["x-cron-secret"];
-
-    if (process.env.CRON_SECRET && cronSecret !== process.env.CRON_SECRET) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized automation request",
-      });
-    }
-
     const limit = req.body?.limit || req.query?.limit || 20;
 
     const result = await processAutomationJobs({
@@ -5810,10 +5850,17 @@ async function processAutomationJobsHandler(req, res) {
   }
 }
 
-app.post("/process-automation-jobs", processAutomationJobsHandler);
-app.get("/process-automation-jobs", processAutomationJobsHandler);
+app.post(
+  "/process-automation-jobs",
+  requireAutomationSecret,
+  processAutomationJobsHandler
+);
 
-app.get("/payment-profile", requireAuthenticatedUser, async (req, res) => {
+app.get(
+  "/payment-profile",
+  requireAuthenticatedUser,
+  paymentRateLimiter,
+  async (req, res) => {
   try {
     const profile = await refreshDirectDebitStatus(req.authUser.id).catch(
       async (error) => {
@@ -5842,7 +5889,38 @@ app.get("/payment-profile", requireAuthenticatedUser, async (req, res) => {
   }
 });
 
-app.put("/payment-profile", requireAuthenticatedUser, async (req, res) => {
+app.get(
+  "/fee-ledger",
+  requireAuthenticatedUser,
+  paymentRateLimiter,
+  async (req, res) => {
+    try {
+      const ledger = await getFeeLedgerSummary(req.authUser.id, {
+        limit: getSafeLimit(req.query?.limit, 50, 100),
+      });
+
+      return res.json({
+        success: true,
+        ledger,
+      });
+    } catch (error) {
+      console.error("Fee ledger lookup failed:", {
+        user_id: req.authUser.id,
+        error: error.message,
+      });
+      return res.status(500).json({
+        success: false,
+        error: "Fee balance could not be loaded.",
+      });
+    }
+  }
+);
+
+app.put(
+  "/payment-profile",
+  requireAuthenticatedUser,
+  paymentRateLimiter,
+  async (req, res) => {
   try {
     const profile = await savePayoutBankDetails(req.authUser.id, req.body || {});
 
@@ -5873,6 +5951,7 @@ app.put("/payment-profile", requireAuthenticatedUser, async (req, res) => {
 app.post(
   "/payment-profile/direct-debit/setup",
   requireAuthenticatedUser,
+  paymentRateLimiter,
   async (req, res) => {
     try {
       const result = await startDirectDebitSetup(req.authUser.id);
@@ -5927,15 +6006,15 @@ app.post("/payments/webhooks/gocardless", async (req, res) => {
   }
 });
 
-app.post("/update-claim-payment", async (req, res) => {
+app.post("/update-claim-payment", requireAuthenticatedUser, paymentRateLimiter, requireClaimId, async (req, res) => {
   try {
     const {
       user_id,
       claim_id,
       compensation_amount,
-      fee_percentage = 10,
-      payment_status = "fee_due",
     } = req.body;
+    const fee_percentage = 10;
+    const payment_status = "fee_due";
 
     if (!user_id || !claim_id) {
       return res.status(400).json({
@@ -5951,17 +6030,15 @@ app.post("/update-claim-payment", async (req, res) => {
       });
     }
 
-    const allowedPaymentStatuses = [
-      "not_paid",
-      "paid",
-      "fee_due",
-      "fee_collected",
-    ];
-
-    if (!allowedPaymentStatuses.includes(payment_status)) {
+    const cleanCompensationAmount = Number(compensation_amount);
+    if (
+      !Number.isFinite(cleanCompensationAmount) ||
+      cleanCompensationAmount <= 0 ||
+      cleanCompensationAmount > 100000
+    ) {
       return res.status(400).json({
         success: false,
-        error: "Invalid payment_status",
+        error: "compensation_amount must be between 0.01 and 100000.",
       });
     }
 
@@ -6140,7 +6217,7 @@ app.post("/update-claim-payment", async (req, res) => {
   }
 });
 
-app.post("/early-access", async (req, res) => {
+app.post("/early-access", earlyAccessRateLimiter, async (req, res) => {
   try {
     const {
       full_name,
@@ -6160,24 +6237,35 @@ app.post("/early-access", async (req, res) => {
       biggest_frustration,
     } = req.body;
 
+    const requiredTextValues = [
+      full_name,
+      email,
+      from_station,
+      to_station,
+      train_operator,
+      commute_frequency,
+      ticket_type,
+      ticket_cost,
+      ticket_start_date,
+      ticket_end_date,
+      smartcard_provider,
+      smartcard_number,
+      currently_claims_delay_repay,
+    ].map((value) => boundedText(value, { max: 500, allowEmpty: false }));
+
     if (
-      !full_name ||
-      !email ||
-      !from_station ||
-      !to_station ||
-      !train_operator ||
-      !commute_frequency ||
-      !ticket_type ||
-      !ticket_cost ||
-      !ticket_start_date ||
-      !ticket_end_date ||
-      !smartcard_provider ||
-      !smartcard_number ||
-      !currently_claims_delay_repay
+      requiredTextValues.some((value) => !value) ||
+      boundedText(mobile, { max: 40 }) === null ||
+      boundedText(biggest_frustration, { max: 5000 }) === null
     ) {
       return res.status(400).json({
-        error: "Missing required fields",
+        error: "Required fields are missing or exceed the allowed length.",
       });
+    }
+
+    const cleanEmail = boundedText(email, { max: 254, allowEmpty: false });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ error: "Enter a valid email address." });
     }
 
     const result = await query(
@@ -6208,7 +6296,7 @@ app.post("/early-access", async (req, res) => {
       `,
       [
         full_name,
-        email.toLowerCase(),
+        cleanEmail.toLowerCase(),
         mobile || null,
         from_station,
         to_station,

@@ -1,3 +1,6 @@
 node_modules
 .env
 src/.env
+.env.local
+.env.*.local
+operator-run-artifacts/
