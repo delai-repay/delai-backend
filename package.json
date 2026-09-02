@@ -8,7 +8,8 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "test:release1": "node scripts/testRelease1SecurityFeeLedger.js",
-    "test:regression": "node scripts/testSubmissionValidation.js && node scripts/testStep20ASecurity.js && node scripts/testStep20Payments.js && node scripts/testStep20BCancellations.js && node scripts/testStep20CCancellations.js && node scripts/testStep20DCancellationExecutor.js && node scripts/testRelease1SecurityFeeLedger.js"
+    "test:release2a": "node scripts/testRelease2AClaimApproval.js",
+    "test:regression": "node scripts/testSubmissionValidation.js && node scripts/testStep20ASecurity.js && node scripts/testStep20Payments.js && node scripts/testStep20BCancellations.js && node scripts/testStep20CCancellations.js && node scripts/testStep20DCancellationExecutor.js && node scripts/testRelease1SecurityFeeLedger.js && node scripts/testRelease2AClaimApproval.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.4",

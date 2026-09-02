@@ -28,7 +28,12 @@ class BaseOperatorAdapter {
     };
   }
 
-  async submitClaim({ claim, detectedDelay, submissionContext } = {}) {
+  async submitClaim({
+    claim,
+    detectedDelay,
+    submissionContext,
+    finalSubmitAuthorization,
+  } = {}) {
     return {
       submitted: false,
       blocked: true,
@@ -41,6 +46,7 @@ class BaseOperatorAdapter {
         detectedDelay,
         submissionContext,
       }),
+      finalSubmitAuthorized: finalSubmitAuthorization?.authorized === true,
     };
   }
 

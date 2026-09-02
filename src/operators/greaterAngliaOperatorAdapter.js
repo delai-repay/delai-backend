@@ -7,6 +7,7 @@ import {
   isGreaterAngliaPlaywrightExecutorEnabled,
 } from "./greaterAngliaDelayRepayPortal.js";
 import { runGreaterAngliaPlaywrightSubmission } from "./greaterAngliaPlaywrightExecutor.js";
+import { resolveFinalSubmitGate } from "./submissionApprovalService.js";
 
 function cleanText(value) {
   if (value === undefined || value === null) {
@@ -117,7 +118,12 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
     };
   }
 
-  async submitClaim({ claim, detectedDelay, submissionContext } = {}) {
+  async submitClaim({
+    claim,
+    detectedDelay,
+    submissionContext,
+    finalSubmitAuthorization,
+  } = {}) {
     const mappedSubmission = this.buildSubmissionPayload({
       claim,
       detectedDelay,
@@ -148,7 +154,11 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
 
     const submissionMode = getGreaterAngliaSubmissionMode();
     const playwrightExecutorEnabled = isGreaterAngliaPlaywrightExecutorEnabled();
-    const finalSubmitEnabled = isGreaterAngliaFinalSubmitEnabled();
+    const finalSubmitGate = resolveFinalSubmitGate({
+      globalEnabled: isGreaterAngliaFinalSubmitEnabled(),
+      claimApproval: finalSubmitAuthorization,
+    });
+    const finalSubmitEnabled = finalSubmitGate.enabled;
 
     if (submissionMode !== "playwright") {
       return {
@@ -163,6 +173,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         submissionStrategy: this.submissionStrategy,
         playwrightExecutorEnabled,
         finalSubmitEnabled,
+        finalSubmitGate,
         customer_status: "operator_submission_pending",
         customer_title: "Claim ready for Delai submission",
         customer_message:
@@ -187,6 +198,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         submissionStrategy: this.submissionStrategy,
         playwrightExecutorEnabled,
         finalSubmitEnabled,
+        finalSubmitGate,
         customer_status: "operator_submission_pending",
         customer_title: "Claim ready for Delai submission",
         customer_message:
@@ -216,6 +228,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         submissionStrategy: this.submissionStrategy,
         playwrightExecutorEnabled,
         finalSubmitEnabled,
+        finalSubmitGate,
         mappedSubmission,
         portalSubmissionPlan,
       };
@@ -233,6 +246,7 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
       submissionStrategy: this.submissionStrategy,
       playwrightExecutorEnabled,
       finalSubmitEnabled,
+      finalSubmitGate,
       customer_status:
         executorResult.customer_status || "operator_submission_pending",
       customer_title:
