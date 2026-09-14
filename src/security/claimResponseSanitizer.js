@@ -11,6 +11,15 @@ function buildSafeClaimResponse(claim = {}) {
     id: cleanString(claim.id, 80),
     status: cleanString(claim.status, 60),
     submission_status: cleanString(claim.submission_status, 80),
+    submission_deadline_date: cleanString(claim.submission_deadline_date, 10),
+    submission_deadline_checked_at: cleanString(
+      claim.submission_deadline_checked_at,
+      40
+    ),
+    submission_deadline_expired_at: cleanString(
+      claim.submission_deadline_expired_at,
+      40
+    ),
     claim_type: cleanString(claim.claim_type, 80),
     compensation_route: cleanString(claim.compensation_route, 100),
     journey_outcome: cleanString(claim.journey_outcome, 60),

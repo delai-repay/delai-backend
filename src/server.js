@@ -46,6 +46,7 @@ import {
 } from "./delays/journeyDisruptionRouting.js";
 import { getCancellationAdapter } from "./cancellations/cancellationAdapterRegistry.js";
 import { validateCancellationSubmissionContext } from "./cancellations/cancellationValidation.js";
+import { evaluateGreaterAngliaClaimDeadline } from "./claims/claimDeadlinePolicy.js";
 import { isGreaterAngliaFinalSubmitEnabled } from "./operators/greaterAngliaDelayRepayPortal.js";
 import {
   approveClaimFinalSubmission,
@@ -172,6 +173,49 @@ function buildSubmissionSnapshotHash({ claim, detectedDelay, submissionContext }
       })
     )
     .digest("hex");
+}
+
+async function evaluateAndPersistGreaterAngliaDeadline({ claim, detectedDelay }) {
+  if (!isGreaterAngliaName(detectedDelay?.operator)) {
+    return { applicable: false, eligible: true, reason: "operator_policy_not_applicable" };
+  }
+
+  const deadline = evaluateGreaterAngliaClaimDeadline({
+    serviceDate: detectedDelay?.service_date || detectedDelay?.delay_date,
+  });
+  const checkedAt = new Date().toISOString();
+  const updatePayload = {
+    submission_deadline_date: deadline.deadlineDate,
+    submission_deadline_checked_at: checkedAt,
+  };
+
+  if (!deadline.valid) {
+    updatePayload.submission_status = "awaiting_information";
+    updatePayload.submission_error =
+      "A valid journey date is required before Delai can confirm the claim deadline.";
+  } else if (deadline.expired) {
+    updatePayload.submission_status = "claim_deadline_expired";
+    updatePayload.submission_error =
+      "Greater Anglia requires Delay Repay claims within 28 days of the delayed journey.";
+    updatePayload.submission_deadline_expired_at =
+      claim?.submission_deadline_expired_at || checkedAt;
+  } else {
+    updatePayload.submission_deadline_expired_at = null;
+  }
+
+  const { error } = await withTimeout(
+    supabaseAdmin
+      .from("claims")
+      .update(updatePayload)
+      .eq("id", claim.id)
+      .eq("user_id", claim.user_id),
+    10000,
+    "Persist Greater Anglia claim deadline"
+  );
+
+  if (error) throw error;
+
+  return { applicable: true, ...deadline, checkedAt };
 }
 
 async function requireAuthenticatedUser(req, res, next) {
@@ -2194,6 +2238,44 @@ async function processClaimSubmitJob(job) {
       customer_next_step:
         "The cancellation route must be corrected before automation can continue.",
       claim,
+    };
+  }
+
+  const deadlineStatus = await evaluateAndPersistGreaterAngliaDeadline({
+    claim,
+    detectedDelay,
+  });
+
+  if (!deadlineStatus.eligible) {
+    const missingDate = deadlineStatus.valid === false;
+    return {
+      success: true,
+      blocked: true,
+      ready: false,
+      message: missingDate
+        ? "A valid journey date is required before Delai can confirm eligibility."
+        : `This claim expired after ${deadlineStatus.deadlineDate} and cannot be submitted.`,
+      customer_status: missingDate
+        ? "awaiting_information"
+        : "claim_deadline_expired",
+      customer_title: missingDate
+        ? "Journey date required"
+        : "Claim deadline has passed",
+      customer_message: missingDate
+        ? "Delai cannot safely submit this claim until its journey date is confirmed."
+        : "Greater Anglia requires Delay Repay claims within 28 days of the delayed journey.",
+      customer_next_step: missingDate
+        ? "Confirm the exact journey date before trying again."
+        : "This journey will remain in your history, but Delai will not send an expired claim.",
+      deadline: deadlineStatus,
+      claim: {
+        ...claim,
+        submission_status: missingDate
+          ? "awaiting_information"
+          : "claim_deadline_expired",
+        submission_deadline_date: deadlineStatus.deadlineDate,
+        submission_deadline_checked_at: deadlineStatus.checkedAt,
+      },
     };
   }
 
@@ -5382,6 +5464,23 @@ app.post(
         return res.status(400).json({
           success: false,
           error: "Passenger travel must be confirmed before final submission approval.",
+        });
+      }
+
+      const deadlineStatus = await evaluateAndPersistGreaterAngliaDeadline({
+        claim,
+        detectedDelay,
+      });
+
+      if (!deadlineStatus.eligible) {
+        return res.status(400).json({
+          success: false,
+          error:
+            deadlineStatus.valid === false
+              ? "A valid journey date is required before final submission approval."
+              : "The 28-day Greater Anglia claim deadline has passed.",
+          code: deadlineStatus.reason,
+          deadline: deadlineStatus,
         });
       }
 
