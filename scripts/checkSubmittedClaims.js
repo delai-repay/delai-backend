@@ -100,7 +100,9 @@ async function processAutomationJobs() {
       }
     }
 
-    process.exitCode = 0;
+    if (process.exitCode !== 1) {
+      process.exitCode = 0;
+    }
   } catch (error) {
     if (error.name === "AbortError") {
       console.error(`Automation job processing timed out after ${timeoutMs}ms.`);
@@ -112,4 +114,41 @@ async function processAutomationJobs() {
   }
 }
 
+async function monitorCommutes() {
+  if (!cronSecret) return;
+
+  const endpoint = `${backendUrl}/monitor-commutes`;
+  try {
+    console.log("Monitoring saved commutes with the exact-service feed...");
+    const response = await fetchWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-cron-secret": cronSecret,
+        },
+        body: JSON.stringify({}),
+      },
+      timeoutMs
+    );
+    const result = await readJsonResponse(response);
+    if (!response.ok || !result.ok) {
+      console.error("Commute monitoring failed.", { status: response.status, result });
+      process.exitCode = 1;
+      return;
+    }
+    console.log("Commute monitoring completed.", {
+      provider_status: result.provider_status,
+      checked_commutes: result.checked_commutes ?? 0,
+      supplied_services: result.supplied_service_count ?? 0,
+      created: result.created_count ?? 0,
+    });
+  } catch (error) {
+    console.error("Commute monitoring error:", error);
+    process.exitCode = 1;
+  }
+}
+
+await monitorCommutes();
 await processAutomationJobs();

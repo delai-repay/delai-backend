@@ -44,6 +44,10 @@ import {
   isCancelledService,
   normaliseServiceStatus,
 } from "./delays/journeyDisruptionRouting.js";
+import {
+  createNationalRailDarwinClient,
+  resolveCommuteCrs,
+} from "./delays/nationalRailDarwinClient.js";
 import { getCancellationAdapter } from "./cancellations/cancellationAdapterRegistry.js";
 import { validateCancellationSubmissionContext } from "./cancellations/cancellationValidation.js";
 import { evaluateGreaterAngliaClaimDeadline } from "./claims/claimDeadlinePolicy.js";
@@ -3906,7 +3910,7 @@ async function closeSiblingCandidatesAfterConfirmation(detectedDelay) {
   return data || [];
 }
 
-app.post("/detect-delays", requireAutomationSecret, async (req, res) => {
+async function handleDetectDelays(req, res) {
   try {
     const { data: commutes, error: commuteError } = await withTimeout(
       supabaseAdmin.from("commutes").select("*"),
@@ -3930,8 +3934,18 @@ app.post("/detect-delays", requireAutomationSecret, async (req, res) => {
     }
 
     const today = new Date();
-    const todayDate = today.toISOString().split("T")[0];
-    const todayDay = today.toLocaleDateString("en-GB", { weekday: "long" });
+    const londonDateParts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/London",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(today);
+    const readLondonPart = (type) => londonDateParts.find((part) => part.type === type)?.value;
+    const todayDate = `${readLondonPart("year")}-${readLondonPart("month")}-${readLondonPart("day")}`;
+    const todayDay = today.toLocaleDateString("en-GB", {
+      timeZone: "Europe/London",
+      weekday: "long",
+    });
     const forceDetection = req.body?.force === true;
 
     const suppliedServices = Array.isArray(req.body?.services)
@@ -4259,8 +4273,54 @@ app.post("/detect-delays", requireAutomationSecret, async (req, res) => {
       error: error.message,
     });
   }
-});
+}
 
+app.post("/detect-delays", requireAutomationSecret, handleDetectDelays);
+
+app.post("/monitor-commutes", requireAutomationSecret, async (req, res) => {
+  try {
+    const darwin = createNationalRailDarwinClient();
+    if (!darwin.enabled) {
+      return res.json({ ok: true, provider_status: "disabled", message: "Automatic commute monitoring is safety locked.", queried_route_count: 0, supplied_service_count: 0, created_count: 0 });
+    }
+    const { data: commutes, error } = await withTimeout(
+      supabaseAdmin.from("commutes").select("*"), 10000, "Commute monitoring lookup"
+    );
+    if (error) throw error;
+    const todayDay = new Date().toLocaleDateString("en-GB", { timeZone: "Europe/London", weekday: "long" });
+    const routes = new Map();
+    const skippedCommutes = [];
+    for (const commute of commutes || []) {
+      if (!Array.isArray(commute.travel_days) || !commute.travel_days.includes(todayDay)) continue;
+      for (const direction of ["outbound", "return"]) {
+        const travelWindow = direction === "outbound" ? commute.outbound_time : commute.return_time;
+        if (!parseCommuteWindow(travelWindow)) continue;
+        const route = resolveCommuteCrs(commute, direction);
+        if (!route.originCrs || !route.destinationCrs) {
+          skippedCommutes.push({ commute_id: commute.id, direction, reason: "station_crs_missing" });
+          continue;
+        }
+        const key = `${route.originCrs}|${route.destinationCrs}`;
+        if (!routes.has(key)) routes.set(key, route);
+      }
+    }
+    const services = [];
+    const providerResults = [];
+    for (const route of routes.values()) {
+      const result = await darwin.getServices(route);
+      providerResults.push({ origin_crs: route.originCrs, destination_crs: route.destinationCrs, status: result.status, service_count: result.services.length });
+      services.push(...result.services);
+    }
+    if (providerResults.some((result) => result.status !== "connected")) {
+      return res.status(503).json({ ok: false, provider_status: providerResults[0]?.status || "unavailable", queried_route_count: routes.size, provider_results: providerResults, skipped_commutes: skippedCommutes, error: "Darwin did not provide an authenticated exact-service feed." });
+    }
+    req.body = { services, force: false };
+    return handleDetectDelays(req, res);
+  } catch (error) {
+    console.error("Automatic commute monitoring failed:", error);
+    return res.status(502).json({ ok: false, provider_status: error?.name === "AbortError" ? "timeout" : "provider_error", error: error.message });
+  }
+});
 
 app.get("/pending-delay-confirmations", requireAuthenticatedUser, claimMutationRateLimiter, async (req, res) => {
   try {
