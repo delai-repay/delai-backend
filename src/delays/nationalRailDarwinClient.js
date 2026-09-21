@@ -1,4 +1,5 @@
-const DEFAULT_BASE_URL = "https://realtime.nationalrail.co.uk/LDBWS";
+const DEFAULT_BASE_URL =
+  "https://api1.raildata.org.uk/1010-live-departure-board-dep1_2/LDBWS";
 
 const PILOT_STATION_CODES = new Map([
   ["hatfield peverel", "HAP"],
@@ -118,15 +119,17 @@ export function normaliseDarwinBoard({
 
 export function createNationalRailDarwinClient({ env = process.env, fetchImpl = fetch } = {}) {
   const enabled = String(env.NATIONAL_RAIL_DARWIN_ENABLED || "false").toLowerCase() === "true";
-  const username = String(env.NATIONAL_RAIL_DARWIN_USERNAME || "").trim();
-  const password = String(env.NATIONAL_RAIL_DARWIN_PASSWORD || "").trim();
+  const apiKey = String(env.NATIONAL_RAIL_DARWIN_API_KEY || "").trim();
   const baseUrl = String(env.NATIONAL_RAIL_DARWIN_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
   const timeoutMs = Math.max(1000, Number(env.NATIONAL_RAIL_DARWIN_TIMEOUT_MS || 10000));
 
-  async function getServices({ originCrs, destinationCrs, originName, destinationName }) {
-    if (!enabled) return { status: "disabled", services: [] };
-    if (!username || !password) return { status: "credentials_missing", services: [] };
+  async function getServices({ originCrs, destinationCrs, originName, destinationName }, { probe = false } = {}) {
+    if (!enabled && !probe) return { status: "disabled", services: [] };
+    if (!apiKey) return { status: "credentials_missing", services: [] };
     if (!originCrs || !destinationCrs) return { status: "station_crs_missing", services: [] };
+    if (!/^[A-Z]{3}$/.test(originCrs) || !/^[A-Z]{3}$/.test(destinationCrs)) {
+      return { status: "station_crs_invalid", services: [] };
+    }
 
     const url = new URL(
       `${baseUrl}/api/20220120/GetDepBoardWithDetails/${encodeURIComponent(originCrs)}`
@@ -143,14 +146,21 @@ export function createNationalRailDarwinClient({ env = process.env, fetchImpl = 
       const response = await fetchImpl(url, {
         headers: {
           Accept: "application/json",
-          Authorization: `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`,
+          "x-apikey": apiKey,
         },
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`Darwin LDBWS returned HTTP ${response.status}.`);
       const board = await response.json();
+      if (!board || typeof board !== "object" || !Array.isArray(board.trainServices)) {
+        throw new Error("Darwin LDBWS returned a board without trainServices; check detailed-board access.");
+      }
       return {
         status: "connected",
+        board_train_count: board.trainServices.length,
+        board_with_calling_points_count: board.trainServices.filter(
+          (service) => Array.isArray(service?.subsequentCallingPoints)
+        ).length,
         services: normaliseDarwinBoard({
           board,
           originName,
@@ -166,4 +176,3 @@ export function createNationalRailDarwinClient({ env = process.env, fetchImpl = 
 
   return { enabled, getServices };
 }
-

@@ -4277,6 +4277,39 @@ async function handleDetectDelays(req, res) {
 
 app.post("/detect-delays", requireAutomationSecret, handleDetectDelays);
 
+// Read-only gateway check. It never queries customer records or creates a delay.
+app.post("/probe-darwin", requireAutomationSecret, async (_req, res) => {
+  try {
+    const result = await createNationalRailDarwinClient().getServices(
+      {
+        originCrs: "HAP",
+        destinationCrs: "LST",
+        originName: "Hatfield Peverel",
+        destinationName: "London Liverpool Street",
+      },
+      { probe: true }
+    );
+    if (result.status !== "connected") {
+      return res.status(503).json({ ok: false, provider_status: result.status });
+    }
+    return res.json({
+      ok: true,
+      provider_status: result.status,
+      board_train_count: result.board_train_count,
+      board_with_calling_points_count: result.board_with_calling_points_count,
+      exact_service_count: result.services.length,
+      note: "Read-only feed check; no customer records or claims were changed.",
+    });
+  } catch (error) {
+    console.error("Darwin gateway probe failed:", error);
+    return res.status(502).json({
+      ok: false,
+      provider_status: "provider_error",
+      error: error.message,
+    });
+  }
+});
+
 app.post("/monitor-commutes", requireAutomationSecret, async (req, res) => {
   try {
     const darwin = createNationalRailDarwinClient();

@@ -61,16 +61,16 @@ const disabled = createNationalRailDarwinClient({ env: {}, fetchImpl: () => asse
 assert.equal((await disabled.getServices({})).status, "disabled");
 
 let requestedUrl;
-let requestedAuthorization;
+let requestedKey;
 const client = createNationalRailDarwinClient({
   env: {
     NATIONAL_RAIL_DARWIN_ENABLED: "true",
-    NATIONAL_RAIL_DARWIN_USERNAME: "delai-user",
-    NATIONAL_RAIL_DARWIN_PASSWORD: "secret",
+    NATIONAL_RAIL_DARWIN_API_KEY: "sample-consumer-key",
   },
   fetchImpl: async (url, options) => {
     requestedUrl = String(url);
-    requestedAuthorization = options.headers.Authorization;
+    requestedKey = options.headers["x-apikey"];
+    assert.equal(options.headers.Authorization, undefined);
     return { ok: true, json: async () => ({ generatedAt: "2026-09-14T08:00:00+01:00", trainServices: [] }) };
   },
 });
@@ -81,12 +81,39 @@ const liveResult = await client.getServices({
   destinationName: "London Liverpool Street",
 });
 assert.equal(liveResult.status, "connected");
+assert.match(requestedUrl, /^https:\/\/api1\.raildata\.org\.uk\/1010-live-departure-board-dep1_2\/LDBWS\//);
 assert.match(requestedUrl, /GetDepBoardWithDetails\/HAP/);
 assert.match(requestedUrl, /filterCrs=LST/);
-assert.equal(requestedAuthorization, `Basic ${Buffer.from("delai-user:secret").toString("base64")}`);
+assert.equal(requestedKey, "sample-consumer-key");
+
+const missingKey = createNationalRailDarwinClient({ env: { NATIONAL_RAIL_DARWIN_ENABLED: "true" }, fetchImpl: () => assert.fail() });
+assert.equal((await missingKey.getServices({ originCrs: "HAP", destinationCrs: "LST" })).status, "credentials_missing");
+
+const probeWhileDisabled = createNationalRailDarwinClient({
+  env: { NATIONAL_RAIL_DARWIN_API_KEY: "sample-consumer-key" },
+  fetchImpl: async () => ({ ok: true, json: async () => ({ trainServices: [] }) }),
+});
+assert.equal((await probeWhileDisabled.getServices({ originCrs: "HAP", destinationCrs: "LST" }, { probe: true })).status, "connected");
+assert.equal((await probeWhileDisabled.getServices({ originCrs: "HAP", destinationCrs: "LST" })).status, "disabled");
+
+const invalidShape = createNationalRailDarwinClient({
+  env: { NATIONAL_RAIL_DARWIN_API_KEY: "sample-consumer-key" },
+  fetchImpl: async () => ({ ok: true, json: async () => ({ error: "unexpected response" }) }),
+});
+await assert.rejects(() => invalidShape.getServices({ originCrs: "HAP", destinationCrs: "LST" }, { probe: true }), /without trainServices/);
+
+const deniedDetails = createNationalRailDarwinClient({
+  env: { NATIONAL_RAIL_DARWIN_API_KEY: "sample-consumer-key" },
+  fetchImpl: async () => ({ ok: false, status: 403 }),
+});
+await assert.rejects(
+  () => deniedDetails.getServices({ originCrs: "HAP", destinationCrs: "LST" }, { probe: true }),
+  /HTTP 403/
+);
 
 const serverSource = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
 assert.match(serverSource, /app\.post\("\/monitor-commutes", requireAutomationSecret/);
+assert.match(serverSource, /app\.post\("\/probe-darwin", requireAutomationSecret/);
 assert.match(serverSource, /timeZone: "Europe\/London"/);
 
 console.log("Release 2C automatic commute monitoring tests passed.");
