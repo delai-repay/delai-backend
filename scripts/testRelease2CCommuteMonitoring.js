@@ -115,5 +115,8 @@ const serverSource = await readFile(new URL("../src/server.js", import.meta.url)
 assert.match(serverSource, /app\.post\("\/monitor-commutes", requireAutomationSecret/);
 assert.match(serverSource, /app\.post\("\/probe-darwin", requireAutomationSecret/);
 assert.match(serverSource, /timeZone: "Europe\/London"/);
+assert.match(serverSource, /provider_status: "connected"/);
+assert.match(serverSource, /provider_results: providerResults/);
+assert.match(serverSource, /returned no qualifying delayed or cancelled services/);
 
 console.log("Release 2C automatic commute monitoring tests passed.");

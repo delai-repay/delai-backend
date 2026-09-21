@@ -4347,6 +4347,21 @@ app.post("/monitor-commutes", requireAutomationSecret, async (req, res) => {
     if (providerResults.some((result) => result.status !== "connected")) {
       return res.status(503).json({ ok: false, provider_status: providerResults[0]?.status || "unavailable", queried_route_count: routes.size, provider_results: providerResults, skipped_commutes: skippedCommutes, error: "Darwin did not provide an authenticated exact-service feed." });
     }
+    if (services.length === 0) {
+      return res.json({
+        ok: true,
+        message: "The exact-service feed connected successfully and returned no qualifying delayed or cancelled services.",
+        provider_status: "connected",
+        checked_commutes: (commutes || []).length,
+        queried_route_count: routes.size,
+        provider_results: providerResults,
+        skipped_commutes: skippedCommutes,
+        supplied_service_count: 0,
+        valid_exact_service_count: 0,
+        created_count: 0,
+        created_delays: [],
+      });
+    }
     req.body = { services, force: false };
     return handleDetectDelays(req, res);
   } catch (error) {
