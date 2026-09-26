@@ -11,7 +11,8 @@
     "test:release2a": "node scripts/testRelease2AClaimApproval.js",
     "test:release2b": "node scripts/testRelease2BClaimDeadline.js",
     "test:release2c": "node scripts/testRelease2CCommuteMonitoring.js",
-    "test:regression": "node scripts/testSubmissionValidation.js && node scripts/testStep20ASecurity.js && node scripts/testStep20Payments.js && node scripts/testStep20BCancellations.js && node scripts/testStep20CCancellations.js && node scripts/testStep20DCancellationExecutor.js && node scripts/testRelease1SecurityFeeLedger.js && node scripts/testRelease2AClaimApproval.js && node scripts/testRelease2BClaimDeadline.js && node scripts/testRelease2CCommuteMonitoring.js"
+    "test:release2d": "node scripts/testRelease2DConfirmationEmail.js",
+    "test:regression": "node scripts/testSubmissionValidation.js && node scripts/testStep20ASecurity.js && node scripts/testStep20Payments.js && node scripts/testStep20BCancellations.js && node scripts/testStep20CCancellations.js && node scripts/testStep20DCancellationExecutor.js && node scripts/testRelease1SecurityFeeLedger.js && node scripts/testRelease2AClaimApproval.js && node scripts/testRelease2BClaimDeadline.js && node scripts/testRelease2CCommuteMonitoring.js && node scripts/testRelease2DConfirmationEmail.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.4",

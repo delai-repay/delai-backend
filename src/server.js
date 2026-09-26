@@ -48,6 +48,16 @@ import {
   createNationalRailDarwinClient,
   resolveCommuteCrs,
 } from "./delays/nationalRailDarwinClient.js";
+import {
+  createConfirmationToken,
+  hashIncomingConfirmationToken,
+} from "./notifications/confirmationTokenService.js";
+import {
+  buildDelayConfirmationEmail,
+  emailDeliveryConfig,
+  sendResendEmail,
+  validateEmailDeliveryConfig,
+} from "./notifications/resendEmailClient.js";
 import { getCancellationAdapter } from "./cancellations/cancellationAdapterRegistry.js";
 import { validateCancellationSubmissionContext } from "./cancellations/cancellationValidation.js";
 import { evaluateGreaterAngliaClaimDeadline } from "./claims/claimDeadlinePolicy.js";
@@ -117,6 +127,11 @@ const earlyAccessRateLimiter = createRateLimiter({
   windowMs: 60 * 60 * 1000,
   max: Number(process.env.EARLY_ACCESS_RATE_LIMIT_MAX || 10),
   keyPrefix: "early-access",
+});
+const confirmationLinkRateLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.CONFIRMATION_LINK_RATE_LIMIT_MAX || 30),
+  keyPrefix: "confirmation-link",
 });
 
 app.use(apiRateLimiter);
@@ -3644,6 +3659,171 @@ function buildDelayConfirmationCopy(detectedDelay) {
   };
 }
 
+async function getConfirmationRecipientEmail(userId) {
+  const { data, error } = await withTimeout(
+    supabaseAdmin.auth.admin.getUserById(userId),
+    10000,
+    "Confirmation email recipient lookup"
+  );
+
+  if (error) throw error;
+  const email = String(data?.user?.email || "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+}
+
+async function createDelayConfirmationTokenRecord({
+  userId,
+  detectedDelayId,
+  notificationId,
+}) {
+  const now = new Date().toISOString();
+  const { error: revokeError } = await withTimeout(
+    supabaseAdmin
+      .from("delay_confirmation_tokens")
+      .update({ revoked_at: now })
+      .eq("notification_id", notificationId)
+      .is("consumed_at", null)
+      .is("revoked_at", null),
+    10000,
+    "Revoke previous confirmation links"
+  );
+  if (revokeError) throw revokeError;
+
+  const token = createConfirmationToken();
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("delay_confirmation_tokens")
+      .insert({
+        user_id: userId,
+        detected_delay_id: detectedDelayId,
+        notification_id: notificationId,
+        token_hash: token.tokenHash,
+        expires_at: token.expiresAt,
+      })
+      .select("id, expires_at")
+      .single(),
+    10000,
+    "Create confirmation link token"
+  );
+  if (error) throw error;
+
+  return { ...token, id: data.id, expiresAt: data.expires_at };
+}
+
+async function deliverDelayConfirmationEmail({
+  detectedDelay,
+  notification,
+}) {
+  const deliveryConfig = emailDeliveryConfig();
+  if (!deliveryConfig.enabled) {
+    return { sent: false, skipped: true, code: "email_delivery_disabled" };
+  }
+
+  const validation = validateEmailDeliveryConfig();
+  if (!validation.ok) {
+    return { sent: false, skipped: true, code: validation.code };
+  }
+
+  const { data: existingSent, error: existingError } = await withTimeout(
+    supabaseAdmin
+      .from("notification_email_deliveries")
+      .select("id, provider_message_id, sent_at")
+      .eq("notification_id", notification.id)
+      .eq("status", "sent")
+      .order("created_at", { ascending: false })
+      .limit(1),
+    10000,
+    "Existing confirmation email delivery lookup"
+  );
+  if (existingError) throw existingError;
+  if (existingSent?.length) {
+    return {
+      sent: true,
+      skipped: true,
+      code: "already_sent",
+      providerMessageId: existingSent[0].provider_message_id,
+    };
+  }
+
+  const recipient = await getConfirmationRecipientEmail(detectedDelay.user_id);
+  if (!recipient) {
+    return { sent: false, skipped: true, code: "recipient_email_missing" };
+  }
+
+  const token = await createDelayConfirmationTokenRecord({
+    userId: detectedDelay.user_id,
+    detectedDelayId: detectedDelay.id,
+    notificationId: notification.id,
+  });
+  const confirmationUrl = `${deliveryConfig.publicAppUrl}/confirm-journey?token=${encodeURIComponent(token.rawToken)}`;
+  const email = buildDelayConfirmationEmail({ detectedDelay, confirmationUrl });
+  const idempotencyKey = `delay-confirmation-${notification.id}-${token.id}`;
+
+  const { data: delivery, error: deliveryError } = await withTimeout(
+    supabaseAdmin
+      .from("notification_email_deliveries")
+      .insert({
+        user_id: detectedDelay.user_id,
+        detected_delay_id: detectedDelay.id,
+        notification_id: notification.id,
+        confirmation_token_id: token.id,
+        idempotency_key: idempotencyKey,
+        status: "pending",
+      })
+      .select("id")
+      .single(),
+    10000,
+    "Create confirmation email audit"
+  );
+  if (deliveryError) throw deliveryError;
+
+  try {
+    const result = await sendResendEmail({
+      to: recipient,
+      subject: email.subject,
+      html: email.html,
+      text: email.text,
+      idempotencyKey,
+    });
+    const status = result.sent ? "sent" : "skipped";
+    const { error: updateError } = await withTimeout(
+      supabaseAdmin
+        .from("notification_email_deliveries")
+        .update({
+          status,
+          provider_message_id: result.providerMessageId || null,
+          error_code: result.code || null,
+          sent_at: result.sent ? new Date().toISOString() : null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", delivery.id),
+      10000,
+      "Complete confirmation email audit"
+    );
+    if (updateError) throw updateError;
+    return { ...result, expiresAt: token.expiresAt };
+  } catch (error) {
+    await withTimeout(
+      supabaseAdmin
+        .from("notification_email_deliveries")
+        .update({
+          status: "failed",
+          error_code: String(error.code || "email_delivery_failed").slice(0, 100),
+          error_message: String(error.message || "Email delivery failed.").slice(0, 500),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", delivery.id),
+      10000,
+      "Record confirmation email failure"
+    );
+    return {
+      sent: false,
+      skipped: false,
+      code: String(error.code || "email_delivery_failed"),
+    };
+  }
+}
+
 async function findExistingDelayConfirmationNotification({
   userId,
   detectedDelayId,
@@ -3687,10 +3867,25 @@ async function createDelayConfirmationNotification(detectedDelay) {
   });
 
   if (existingNotification) {
+    let emailDelivery = null;
+    try {
+      emailDelivery = await deliverDelayConfirmationEmail({
+        detectedDelay,
+        notification: existingNotification,
+      });
+    } catch (error) {
+      console.error("Delay confirmation email retry failed:", error.message);
+      emailDelivery = {
+        sent: false,
+        skipped: false,
+        code: "email_delivery_failed",
+      };
+    }
     return {
       skipped: true,
       reason: "duplicate_notification",
       notification: existingNotification,
+      email_delivery: emailDelivery,
     };
   }
 
@@ -3741,9 +3936,25 @@ async function createDelayConfirmationNotification(detectedDelay) {
     throw delayUpdateError;
   }
 
+  let emailDelivery = null;
+  try {
+    emailDelivery = await deliverDelayConfirmationEmail({
+      detectedDelay,
+      notification,
+    });
+  } catch (error) {
+    console.error("Delay confirmation email delivery failed:", error.message);
+    emailDelivery = {
+      sent: false,
+      skipped: false,
+      code: "email_delivery_failed",
+    };
+  }
+
   return {
     skipped: false,
     notification,
+    email_delivery: emailDelivery,
   };
 }
 
@@ -3880,6 +4091,7 @@ async function notifyNextDelayCandidateForGroup({
     reason: notificationResult.reason || null,
     candidate: nextCandidate,
     notification: notificationResult.notification || null,
+    email_delivery: notificationResult.email_delivery || null,
   };
 }
 
@@ -4242,6 +4454,10 @@ async function handleDetectDelays(req, res) {
         delay_minutes: notificationResult.candidate?.delay_minutes || null,
         notification_created:
           Boolean(notificationResult.notification) && !notificationResult.skipped,
+        email_sent: notificationResult.email_delivery?.sent === true,
+        email_status:
+          notificationResult.email_delivery?.code ||
+          (notificationResult.email_delivery?.sent ? "sent" : null),
         skipped: notificationResult.skipped,
         reason: notificationResult.reason || null,
       });
@@ -4336,6 +4552,21 @@ app.post("/monitor-commutes", requireAutomationSecret, async (req, res) => {
         const key = `${route.originCrs}|${route.destinationCrs}`;
         if (!routes.has(key)) routes.set(key, route);
       }
+    }
+    if (routes.size === 0) {
+      return res.json({
+        ok: true,
+        provider_status: "no_scheduled_commutes",
+        message: "No saved commutes are scheduled for today, so the live feed was not queried.",
+        checked_commutes: (commutes || []).length,
+        queried_route_count: 0,
+        provider_results: [],
+        skipped_commutes: skippedCommutes,
+        supplied_service_count: 0,
+        valid_exact_service_count: 0,
+        created_count: 0,
+        created_delays: [],
+      });
     }
     const services = [];
     const providerResults = [];
@@ -4513,7 +4744,7 @@ app.get("/pending-delay-confirmations", requireAuthenticatedUser, claimMutationR
   }
 });
 
-app.post("/respond-delay-confirmation", requireAuthenticatedUser, claimMutationRateLimiter, async (req, res) => {
+async function handleDelayConfirmationResponse(req, res) {
   try {
     const userId = req.authUser.id;
     const detectedDelayId = String(req.body?.detected_delay_id || "").trim();
@@ -4761,7 +4992,7 @@ app.post("/respond-delay-confirmation", requireAuthenticatedUser, claimMutationR
       error: error.message,
     });
   }
-});
+}
 
 app.post("/prepare-claim", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {
   try {
@@ -5492,6 +5723,224 @@ app.post("/mark-claim-ready", requireAuthenticatedUser, claimMutationRateLimiter
     });
   }
 });
+
+async function lookupDelayConfirmationToken(tokenHash) {
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("delay_confirmation_tokens")
+      .select("id, user_id, detected_delay_id, notification_id, expires_at, processing_at, consumed_at, consumed_response, revoked_at")
+      .eq("token_hash", tokenHash)
+      .maybeSingle(),
+    10000,
+    "Confirmation link lookup"
+  );
+  if (error) throw error;
+  return data || null;
+}
+
+function confirmationTokenState(token, now = new Date()) {
+  if (!token) return "invalid";
+  if (token.revoked_at) return "revoked";
+  if (token.consumed_at) return "consumed";
+  if (!token.expires_at || new Date(token.expires_at).getTime() <= now.getTime()) {
+    return "expired";
+  }
+  return "active";
+}
+
+async function claimDelayConfirmationToken(tokenHash) {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("delay_confirmation_tokens")
+      .update({ processing_at: now.toISOString() })
+      .eq("token_hash", tokenHash)
+      .is("consumed_at", null)
+      .is("revoked_at", null)
+      .gt("expires_at", now.toISOString())
+      .or(`processing_at.is.null,processing_at.lt.${staleBefore}`)
+      .select("id, user_id, detected_delay_id, notification_id, expires_at")
+      .maybeSingle(),
+    10000,
+    "Claim confirmation link"
+  );
+  if (error) throw error;
+  return data || null;
+}
+
+async function releaseDelayConfirmationToken(tokenId) {
+  const { error } = await withTimeout(
+    supabaseAdmin
+      .from("delay_confirmation_tokens")
+      .update({ processing_at: null })
+      .eq("id", tokenId)
+      .is("consumed_at", null),
+    10000,
+    "Release confirmation link"
+  );
+  if (error) throw error;
+}
+
+async function consumeDelayConfirmationToken(tokenId, responseValue) {
+  const { data, error } = await withTimeout(
+    supabaseAdmin
+      .from("delay_confirmation_tokens")
+      .update({
+        processing_at: null,
+        consumed_at: new Date().toISOString(),
+        consumed_response: responseValue,
+      })
+      .eq("id", tokenId)
+      .is("consumed_at", null)
+      .select("id")
+      .maybeSingle(),
+    10000,
+    "Consume confirmation link"
+  );
+  if (error) throw error;
+  if (!data) throw new Error("Confirmation link was already used.");
+}
+
+app.get(
+  "/delay-confirmation-token/preview",
+  confirmationLinkRateLimiter,
+  async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.set("Referrer-Policy", "no-referrer");
+    try {
+      const tokenHash = hashIncomingConfirmationToken(req.query?.token);
+      if (!tokenHash) {
+        return res.status(404).json({ success: false, status: "invalid" });
+      }
+      const token = await lookupDelayConfirmationToken(tokenHash);
+      const state = confirmationTokenState(token);
+      if (state !== "active") {
+        return res.status(state === "invalid" ? 404 : 410).json({
+          success: false,
+          status: state,
+        });
+      }
+
+      const { data: detectedDelay, error } = await withTimeout(
+        supabaseAdmin
+          .from("detected_delays")
+          .select("id, user_id, operator, service_date, direction, origin_station, destination_station, scheduled_departure_time, scheduled_arrival_time, delay_minutes, service_status, disruption_reason, passenger_confirmation_status")
+          .eq("id", token.detected_delay_id)
+          .eq("user_id", token.user_id)
+          .maybeSingle(),
+        10000,
+        "Confirmation link journey lookup"
+      );
+      if (error) throw error;
+      if (!detectedDelay || detectedDelay.passenger_confirmation_status !== "pending") {
+        return res.status(410).json({ success: false, status: "resolved" });
+      }
+
+      return res.json({
+        success: true,
+        status: "active",
+        expires_at: token.expires_at,
+        journey: {
+          operator: detectedDelay.operator,
+          service_date: detectedDelay.service_date,
+          direction: detectedDelay.direction,
+          origin_station: detectedDelay.origin_station,
+          destination_station: detectedDelay.destination_station,
+          scheduled_departure_time: detectedDelay.scheduled_departure_time,
+          scheduled_arrival_time: detectedDelay.scheduled_arrival_time,
+          delay_minutes: detectedDelay.delay_minutes,
+          service_status: detectedDelay.service_status,
+          disruption_reason: detectedDelay.disruption_reason,
+          copy: buildDelayConfirmationCopy(detectedDelay),
+        },
+      });
+    } catch (error) {
+      console.error("Confirmation link preview failed:", error.message);
+      return res.status(500).json({ success: false, status: "unavailable" });
+    }
+  }
+);
+
+app.post(
+  "/delay-confirmation-token/respond",
+  confirmationLinkRateLimiter,
+  async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.set("Referrer-Policy", "no-referrer");
+    const rawResponse = String(req.body?.response || "").trim().toLowerCase();
+    const responseValue = ["yes", "true", "1", "confirmed", "abandoned"].includes(rawResponse)
+      ? "yes"
+      : ["no", "false", "0", "rejected"].includes(rawResponse)
+        ? "no"
+        : null;
+    const tokenHash = hashIncomingConfirmationToken(req.body?.token);
+    if (!tokenHash || !responseValue) {
+      return res.status(400).json({ success: false, error: "A valid token and yes/no response are required." });
+    }
+
+    let claimedToken = null;
+    try {
+      claimedToken = await claimDelayConfirmationToken(tokenHash);
+      if (!claimedToken) {
+        const existing = await lookupDelayConfirmationToken(tokenHash);
+        const state = confirmationTokenState(existing);
+        return res.status(state === "invalid" ? 404 : state === "active" ? 409 : 410).json({
+          success: false,
+          status: state === "active" ? "processing" : state,
+        });
+      }
+
+      let capturedStatus = 200;
+      let capturedBody = null;
+      const captureResponse = {
+        status(code) {
+          capturedStatus = code;
+          return this;
+        },
+        json(body) {
+          capturedBody = body;
+          return body;
+        },
+      };
+      await handleDelayConfirmationResponse(
+        {
+          ...req,
+          authUser: { id: claimedToken.user_id },
+          body: {
+            detected_delay_id: claimedToken.detected_delay_id,
+            response: responseValue,
+          },
+        },
+        captureResponse
+      );
+
+      if (capturedStatus >= 200 && capturedStatus < 300 && capturedBody?.success) {
+        await consumeDelayConfirmationToken(claimedToken.id, responseValue);
+      } else {
+        await releaseDelayConfirmationToken(claimedToken.id);
+      }
+      return res.status(capturedStatus).json(capturedBody || { success: false });
+    } catch (error) {
+      if (claimedToken?.id) {
+        try {
+          await releaseDelayConfirmationToken(claimedToken.id);
+        } catch (releaseError) {
+          console.error("Confirmation link release failed:", releaseError.message);
+        }
+      }
+      console.error("Confirmation link response failed:", error.message);
+      return res.status(500).json({ success: false, error: "The confirmation could not be saved." });
+    }
+  }
+);
+
+app.post(
+  "/respond-delay-confirmation",
+  requireAuthenticatedUser,
+  claimMutationRateLimiter,
+  handleDelayConfirmationResponse
+);
 
 app.post(
   "/approve-claim-final-submit",
