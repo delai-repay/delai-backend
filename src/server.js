@@ -58,6 +58,12 @@ import {
   sendResendEmail,
   validateEmailDeliveryConfig,
 } from "./notifications/resendEmailClient.js";
+import {
+  createPilotDeliveryEnv,
+  maskPilotEmail,
+  pilotRecipientMatches,
+  validatePilotEmailCandidate,
+} from "./notifications/pilotEmailPolicy.js";
 import { getCancellationAdapter } from "./cancellations/cancellationAdapterRegistry.js";
 import { validateCancellationSubmissionContext } from "./cancellations/cancellationValidation.js";
 import { evaluateGreaterAngliaClaimDeadline } from "./claims/claimDeadlinePolicy.js";
@@ -3713,13 +3719,14 @@ async function createDelayConfirmationTokenRecord({
 async function deliverDelayConfirmationEmail({
   detectedDelay,
   notification,
+  emailEnv = process.env,
 }) {
-  const deliveryConfig = emailDeliveryConfig();
+  const deliveryConfig = emailDeliveryConfig(emailEnv);
   if (!deliveryConfig.enabled) {
     return { sent: false, skipped: true, code: "email_delivery_disabled" };
   }
 
-  const validation = validateEmailDeliveryConfig();
+  const validation = validateEmailDeliveryConfig(emailEnv);
   if (!validation.ok) {
     return { sent: false, skipped: true, code: validation.code };
   }
@@ -3778,13 +3785,16 @@ async function deliverDelayConfirmationEmail({
   if (deliveryError) throw deliveryError;
 
   try {
-    const result = await sendResendEmail({
-      to: recipient,
-      subject: email.subject,
-      html: email.html,
-      text: email.text,
-      idempotencyKey,
-    });
+    const result = await sendResendEmail(
+      {
+        to: recipient,
+        subject: email.subject,
+        html: email.html,
+        text: email.text,
+        idempotencyKey,
+      },
+      { env: emailEnv }
+    );
     const status = result.sent ? "sent" : "skipped";
     const { error: updateError } = await withTimeout(
       supabaseAdmin
@@ -3848,7 +3858,10 @@ async function findExistingDelayConfirmationNotification({
   return data?.[0] || null;
 }
 
-async function createDelayConfirmationNotification(detectedDelay) {
+async function createDelayConfirmationNotification(
+  detectedDelay,
+  { emailEnv = process.env } = {}
+) {
   if (!detectedDelay?.id || !detectedDelay?.user_id) {
     throw new Error("Detected delay is required to create a confirmation notification.");
   }
@@ -3872,6 +3885,7 @@ async function createDelayConfirmationNotification(detectedDelay) {
       emailDelivery = await deliverDelayConfirmationEmail({
         detectedDelay,
         notification: existingNotification,
+        emailEnv,
       });
     } catch (error) {
       console.error("Delay confirmation email retry failed:", error.message);
@@ -3941,6 +3955,7 @@ async function createDelayConfirmationNotification(detectedDelay) {
     emailDelivery = await deliverDelayConfirmationEmail({
       detectedDelay,
       notification,
+      emailEnv,
     });
   } catch (error) {
     console.error("Delay confirmation email delivery failed:", error.message);
@@ -5801,6 +5816,96 @@ async function consumeDelayConfirmationToken(tokenId, responseValue) {
   if (error) throw error;
   if (!data) throw new Error("Confirmation link was already used.");
 }
+
+app.post(
+  "/send-pilot-confirmation-email",
+  requireAutomationSecret,
+  async (req, res) => {
+    res.set("Cache-Control", "no-store");
+
+    try {
+      const detectedDelayId = String(req.body?.detected_delay_id || "").trim();
+      const pilotValidation = validatePilotEmailCandidate(
+        detectedDelayId,
+        process.env
+      );
+
+      if (!pilotValidation.ok) {
+        const status = pilotValidation.code === "invalid_detected_delay_id" ? 400 : 403;
+        return res.status(status).json({
+          success: false,
+          code: pilotValidation.code,
+          error: "The controlled pilot email request is not allowed.",
+        });
+      }
+
+      const { data: detectedDelay, error: delayError } = await withTimeout(
+        supabaseAdmin
+          .from("detected_delays")
+          .select("*")
+          .eq("id", detectedDelayId)
+          .maybeSingle(),
+        10000,
+        "Pilot confirmation email candidate lookup"
+      );
+
+      if (delayError) throw delayError;
+      if (!detectedDelay) {
+        return res.status(404).json({
+          success: false,
+          code: "pilot_candidate_not_found",
+          error: "The allowlisted pilot candidate was not found.",
+        });
+      }
+      if (detectedDelay.passenger_confirmation_status !== "pending") {
+        return res.status(409).json({
+          success: false,
+          code: "pilot_candidate_not_pending",
+          error: "The allowlisted pilot candidate is no longer awaiting confirmation.",
+        });
+      }
+
+      const recipient = await getConfirmationRecipientEmail(detectedDelay.user_id);
+      if (!recipient || !pilotRecipientMatches(recipient, process.env)) {
+        return res.status(403).json({
+          success: false,
+          code: "pilot_recipient_not_allowlisted",
+          error: "The candidate account does not match the pilot recipient.",
+        });
+      }
+
+      const result = await createDelayConfirmationNotification(detectedDelay, {
+        emailEnv: createPilotDeliveryEnv(process.env),
+      });
+      const delivery = result.email_delivery || null;
+
+      if (!delivery?.sent) {
+        return res.status(502).json({
+          success: false,
+          code: delivery?.code || "pilot_email_delivery_failed",
+          error: "The pilot confirmation email was not sent.",
+          detected_delay_id: detectedDelay.id,
+          masked_recipient: maskPilotEmail(recipient),
+        });
+      }
+
+      return res.json({
+        success: true,
+        status: delivery.code === "already_sent" ? "already_sent" : "sent",
+        detected_delay_id: detectedDelay.id,
+        masked_recipient: maskPilotEmail(recipient),
+        expires_at: delivery.expiresAt || null,
+      });
+    } catch (error) {
+      console.error("Pilot confirmation email failed:", error.message);
+      return res.status(500).json({
+        success: false,
+        code: "pilot_email_failed",
+        error: "The controlled pilot email could not be sent.",
+      });
+    }
+  }
+);
 
 app.get(
   "/delay-confirmation-token/preview",
