@@ -44,13 +44,17 @@ const email = buildDelayConfirmationEmail({
     scheduled_departure_time: "07:48",
     origin_station: "Hatfield Peverel <test>",
     destination_station: "London Liverpool Street",
-    service_date: "2026-09-26",
+    service_date: "2026-10-07",
     delay_minutes: 17,
     service_status: "delayed",
   },
   confirmationUrl,
 });
 assert.match(email.subject, /07:48/);
+assert.match(email.text, /7 October 2026/);
+assert.match(email.html, /7 October 2026/);
+assert.doesNotMatch(email.text, /2026-10-07/);
+assert.doesNotMatch(email.html, /2026-10-07/);
 assert.match(email.text, /Opening the link does not confirm a claim/);
 assert.match(email.html, /Review journey/);
 assert.doesNotMatch(email.html, /Hatfield Peverel <test>/);

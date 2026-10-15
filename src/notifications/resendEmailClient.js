@@ -86,13 +86,33 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function formatServiceDate(value) {
+  const dateValue = clean(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) return "your travel date";
+
+  const date = new Date(`${dateValue}T00:00:00.000Z`);
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.toISOString().slice(0, 10) !== dateValue
+  ) {
+    return "your travel date";
+  }
+
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(date);
+}
+
 export function buildDelayConfirmationEmail({ detectedDelay, confirmationUrl }) {
   const scheduled = clean(
     detectedDelay?.scheduled_departure_time || detectedDelay?.scheduled_time
   );
   const origin = clean(detectedDelay?.origin_station) || "Saved origin";
   const destination = clean(detectedDelay?.destination_station) || "saved destination";
-  const serviceDate = clean(detectedDelay?.service_date) || "your travel date";
+  const serviceDate = formatServiceDate(detectedDelay?.service_date);
   const cancelled = clean(detectedDelay?.service_status).toLowerCase() === "cancelled";
   const delayMinutes = Math.max(0, Number(detectedDelay?.delay_minutes || 0));
   const disruption = cancelled
