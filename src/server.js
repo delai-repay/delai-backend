@@ -13,6 +13,7 @@ import {
 import { getAllOperators } from "./operators/operatorCatalog.js";
 import { buildClaimSubmissionContext } from "./operators/claimSubmissionContext.js";
 import { validateSubmissionContext } from "./operators/submissionValidation.js";
+import { getGreaterAngliaInputLabel } from "./operators/greaterAngliaRequiredInputs.js";
 import {
   getPaymentProfileSummary,
   loadPaymentDetailsForOperator,
@@ -572,6 +573,9 @@ function cleanIssueText(issue) {
 }
 
 function getCustomerMissingDetailLabel(issue) {
+  const operatorInputLabel = getGreaterAngliaInputLabel(issue);
+  if (operatorInputLabel) return operatorInputLabel;
+
   const readableText = cleanIssueText(issue);
   const lowerText = readableText.toLowerCase();
 

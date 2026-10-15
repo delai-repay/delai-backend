@@ -69,6 +69,8 @@ class GreaterAngliaOperatorAdapter extends BaseOperatorAdapter {
         preparedSummary: cleanText(submissionContext?.claim?.preparedSummary),
       },
       passenger: {
+        title: cleanText(passenger.title) || cleanText(passenger.salutation),
+        salutation: cleanText(passenger.salutation) || cleanText(passenger.title),
         fullName: cleanText(passenger.fullName),
         email: cleanText(passenger.email),
         mobile: cleanText(passenger.mobile),

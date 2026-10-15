@@ -1,3 +1,5 @@
+import { getGreaterAngliaRequiredInputIssues } from "./greaterAngliaRequiredInputs.js";
+
 function cleanText(value) {
   if (value === undefined || value === null) {
     return "";
@@ -358,6 +360,20 @@ function validateSubmissionContext(submissionContext) {
       "ticket.destinationStation",
       "The ticket destination does not match the delayed journey destination."
     );
+  }
+
+  // Greater Anglia readiness must agree with the portal executor.
+  for (const issue of getGreaterAngliaRequiredInputIssues(submissionContext)) {
+    const ticketIssueAlreadyReported =
+      issue.field === "ticket.reference" &&
+      errors.some((existing) => ["ticket.smartcardNumber", "ticket.bookingReference"].includes(existing.field));
+    if (!ticketIssueAlreadyReported && !errors.some((existing) => existing.field === issue.field)) {
+      errors.push(issue);
+    }
+  }
+  const blockingFields = new Set(errors.map((issue) => issue.field));
+  for (let index = warnings.length - 1; index >= 0; index -= 1) {
+    if (blockingFields.has(warnings[index].field)) warnings.splice(index, 1);
   }
 
   return {

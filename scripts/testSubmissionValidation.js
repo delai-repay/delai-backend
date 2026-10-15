@@ -16,6 +16,10 @@ const validContext = {
   },
 
   passenger: {
+    title: "Dr",
+    addressLine1: "1 Example Street",
+    postcode: "AA1 1AA",
+    country: "United Kingdom",
     fullName: "Test Passenger",
     email: "test@example.com",
     mobile: "07123456789",
