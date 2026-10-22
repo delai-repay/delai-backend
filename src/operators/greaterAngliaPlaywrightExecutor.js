@@ -1,5 +1,6 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
+import { selectAndVerifyGreaterAngliaAddress, verifyGreaterAngliaReviewAddress } from "./greaterAngliaAddressVerification.js";
 
 const DEFAULT_TIMEOUT_MS = 45000;
 const GREATER_ANGLIA_SMARTCARD_LENGTH = 18;
@@ -158,7 +159,7 @@ function normaliseDateForInput(value) {
 function createRunContext({ mappedSubmission = null, finalSubmitEnabled = false } = {}) {
   return {
     runId: createSafeRunId(),
-    executorVersion: "greater-anglia-end-to-end-3.2",
+    executorVersion: "greater-anglia-end-to-end-3.3-address-verified",
     operator: "Greater Anglia",
     operatorKey: "greater_anglia",
     claimId: mappedSubmission?.claim?.id || null,
@@ -2384,361 +2385,42 @@ async function selectTitleForGreaterAnglia(page, runContext, title) {
   return false;
 }
 
-async function clickPostcodeLookupIfVisible(page, runContext) {
-  const result = await page.evaluate(() => {
-    function visible(element) {
-      const style = window.getComputedStyle(element);
-      const rect = element.getBoundingClientRect();
-      return (
-        style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        rect.width > 0 &&
-        rect.height > 0 &&
-        !element.disabled
-      );
-    }
-
-    function textFor(element) {
-      return String(
-        [
-          element.innerText,
-          element.textContent,
-          element.value,
-          element.getAttribute("aria-label"),
-          element.getAttribute("title"),
-          element.getAttribute("name"),
-          element.getAttribute("id"),
-        ]
-          .filter(Boolean)
-          .join(" ")
-      )
-        .replace(/\s+/g, " ")
-        .trim();
-    }
-
-    function clickElement(element) {
-      element.scrollIntoView({ block: "center", inline: "center" });
-      element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "mouse" }));
-      element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-      element.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerType: "mouse" }));
-      element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-      element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    }
-
-    const controls = Array.from(
-      document.querySelectorAll('button, input[type="button"], input[type="submit"], a, [role="button"]')
-    )
-      .filter(visible)
-      .map((element) => ({ element, text: textFor(element) }))
-      .filter((entry) => entry.text.length > 0);
-
-    const lookupControl = controls
-      .map((entry) => {
-        let score = 0;
-        if (/find\s*address|lookup\s*address|look\s*up\s*address|search\s*address|get\s*address|select\s*address/i.test(entry.text)) score += 100;
-        if (/address/i.test(entry.text)) score += 20;
-        if (/continue|next|submit|cookie|agree/i.test(entry.text)) score -= 80;
-        return { ...entry, score };
-      })
-      .filter((entry) => entry.score > 30)
-      .sort((a, b) => b.score - a.score)[0];
-
-    if (!lookupControl) {
-      return { ok: false, reason: "No postcode lookup button visible" };
-    }
-
-    clickElement(lookupControl.element);
-    return {
-      ok: true,
-      method: "postcode_lookup_button",
-      text: lookupControl.text.slice(0, 120),
-      score: lookupControl.score,
-    };
-  });
-
-  if (result?.ok) {
-    addStep(runContext, "Click postcode address lookup", result);
-    await page.waitForTimeout(1800).catch(() => {});
-    return true;
-  }
-
-  addLog(runContext, "No postcode lookup button needed or visible.", result || {});
-  return false;
-}
-
 async function selectGreaterAngliaAddress(page, runContext, passenger) {
-  const addressLine1 = cleanText(passenger.addressLine1);
-  const addressLine2 = cleanText(passenger.addressLine2);
-  const townCity = cleanText(passenger.townCity);
-  const postcode = cleanText(passenger.postcode);
-
-  if (!postcode) {
-    addWarning(runContext, "Address selection skipped because no postcode was provided.");
-    return false;
-  }
-
-  await page.waitForTimeout(900).catch(() => {});
-  await clickPostcodeLookupIfVisible(page, runContext);
-  await page.waitForTimeout(1800).catch(() => {});
-
-  const result = await page.evaluate(
-    ({ addressLine1, addressLine2, townCity, postcode }) => {
-      function visible(element) {
-        const style = window.getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        return (
-          style.display !== "none" &&
-          style.visibility !== "hidden" &&
-          rect.width > 0 &&
-          rect.height > 0 &&
-          !element.disabled
-        );
-      }
-
-      function norm(text) {
-        return String(text || "")
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, " ")
-          .replace(/\s+/g, " ")
-          .trim();
-      }
-
-      function rawText(element) {
-        return String(
-          [
-            element.innerText,
-            element.textContent,
-            element.value,
-            element.getAttribute("aria-label"),
-            element.getAttribute("placeholder"),
-            element.getAttribute("name"),
-            element.getAttribute("id"),
-            element.getAttribute("formcontrolname"),
-          ]
-            .filter(Boolean)
-            .join(" ")
-        )
-          .replace(/\s+/g, " ")
-          .trim();
-      }
-
-      function nearbyText(element) {
-        const chunks = [rawText(element)];
-
-        if (element.id) {
-          document
-            .querySelectorAll(`label[for="${CSS.escape(element.id)}"]`)
-            .forEach((labelElement) => chunks.push(labelElement.innerText));
-        }
-
-        let current = element;
-        for (let depth = 0; depth < 5 && current; depth += 1) {
-          chunks.push(current.innerText || current.textContent || "");
-          current = current.parentElement;
-        }
-
-        return chunks.join(" ").replace(/\s+/g, " ").trim();
-      }
-
-      function clickElement(element) {
-        element.scrollIntoView({ block: "center", inline: "center" });
-        element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "mouse" }));
-        element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-        element.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerType: "mouse" }));
-        element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-        element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      }
-
-      function addressScore(text) {
-        const normalised = norm(text);
-        let score = 0;
-
-        if (!normalised) return -999;
-        if (/select|choose|address|postcode|post code/.test(normalised)) score += 5;
-        if (/my address is not listed|enter manually|not listed/.test(normalised)) score -= 90;
-        if (/cookie|privacy|terms|accessibility|frequently asked questions|continue|next|submit/.test(normalised)) score -= 90;
-        if (postcode && normalised.includes(norm(postcode))) score += 45;
-        if (addressLine1 && normalised.includes(norm(addressLine1))) score += 120;
-        if (addressLine2 && normalised.includes(norm(addressLine2))) score += 25;
-        if (townCity && normalised.includes(norm(townCity))) score += 35;
-
-        const houseNumber = String(addressLine1 || "").match(/\b\d+[a-z]?\b/i)?.[0];
-        if (houseNumber && normalised.includes(norm(houseNumber))) score += 25;
-
-        const addressWords = norm(addressLine1 || "")
-          .split(" ")
-          .filter((word) => word.length >= 4);
-
-        for (const word of addressWords) {
-          if (normalised.includes(word)) score += 12;
-        }
-
-        return score;
-      }
-
-      // 1) Native address select/dropdown. This is common after postcode lookup.
-      const selectMatches = Array.from(document.querySelectorAll("select"))
-        .filter(visible)
-        .map((select) => {
-          const selectText = nearbyText(select);
-          const options = Array.from(select.options || [])
-            .map((option) => ({ option, text: rawText(option), value: option.value }))
-            .filter((entry) => entry.value && !/select|choose|please/i.test(entry.text));
-
-          const bestOption = options
-            .map((entry) => ({ ...entry, score: addressScore(entry.text) }))
-            .sort((a, b) => b.score - a.score)[0];
-
-          let selectScore = addressScore(selectText);
-          if (/address|postcode|post code/i.test(selectText)) selectScore += 40;
-          if (/title/i.test(selectText)) selectScore -= 120;
-          if (bestOption?.score) selectScore += bestOption.score;
-
-          return { select, selectText, bestOption, score: selectScore };
-        })
-        .filter((entry) => entry.bestOption && entry.score > 15)
-        .sort((a, b) => b.score - a.score);
-
-      if (selectMatches[0]) {
-        const { select, bestOption, selectText, score } = selectMatches[0];
-        select.value = bestOption.value;
-        select.dispatchEvent(new Event("input", { bubbles: true }));
-        select.dispatchEvent(new Event("change", { bubbles: true }));
-        select.dispatchEvent(new Event("blur", { bubbles: true }));
-
-        return {
-          ok: true,
-          method: "native_address_select",
-          selectedText: bestOption.text.slice(0, 180),
-          selectText: selectText.slice(0, 180),
-          score,
-        };
-      }
-
-      // 2) Custom combobox/dropdown: open the address control if visible.
-      const combo = Array.from(
-        document.querySelectorAll("mat-select, [role='combobox'], .mat-select, .mat-mdc-select, input, button, div")
-      )
-        .filter(visible)
-        .map((element) => {
-          const text = nearbyText(element);
-          const rect = element.getBoundingClientRect();
-          let score = addressScore(text);
-          if (/address|postcode|post code/i.test(text)) score += 25;
-          if (/title/i.test(text)) score -= 120;
-          if (element.matches("mat-select, [role='combobox'], .mat-select, .mat-mdc-select")) score += 30;
-          return { element, text, rect, score };
-        })
-        .filter((entry) => entry.score > 25)
-        .sort((a, b) => b.score - a.score)[0];
-
-      if (combo) {
-        clickElement(combo.element);
-      }
-
-      // 3) Click the best visible address option from the opened dropdown/list.
-      const clickables = Array.from(
-        document.querySelectorAll("mat-option, .mat-option, .mat-mdc-option, [role='option'], li, button, a, div, span")
-      )
-        .filter(visible)
-        .map((element) => ({ element, text: rawText(element), score: addressScore(rawText(element)) }))
-        .filter((entry) => entry.text.length > 2)
-        .sort((a, b) => b.score - a.score);
-
-      const bestAddress = clickables.find((entry) => entry.score > 35);
-
-      if (bestAddress) {
-        clickElement(bestAddress.element);
-        return {
-          ok: true,
-          method: "matched_visible_address_option",
-          selectedText: bestAddress.text.slice(0, 180),
-          score: bestAddress.score,
-        };
-      }
-
-      const manual = clickables.find((entry) => /my address is not listed|enter manually|not listed/i.test(entry.text));
-
-      if (manual) {
-        clickElement(manual.element);
-        return {
-          ok: true,
-          method: "manual_address_selected",
-          selectedText: manual.text.slice(0, 180),
-        };
-      }
-
-      return {
-        ok: false,
-        method: "no_address_option_found",
-        postcode,
-        sampleSelects: Array.from(document.querySelectorAll("select"))
-          .filter(visible)
-          .slice(0, 5)
-          .map((select) => ({
-            text: nearbyText(select).slice(0, 160),
-            options: Array.from(select.options || []).slice(0, 8).map((option) => rawText(option).slice(0, 120)),
-          })),
-        sampleOptions: clickables.slice(0, 12).map((entry) => ({
-          text: entry.text.slice(0, 120),
-          score: entry.score,
-        })),
-      };
-    },
-    { addressLine1, addressLine2, townCity, postcode }
-  );
-
-  if (result?.ok) {
-    addStep(runContext, "Select postcode address", result);
-    await page.waitForTimeout(1200).catch(() => {});
-
-    if (result.method === "manual_address_selected") {
-      await fillManualAddressFields(page, runContext, passenger);
-    }
-
+  try {
+    const proof = await selectAndVerifyGreaterAngliaAddress(page, passenger);
+    // Kept in memory for the final review guard; audit redaction covers this key.
+    runContext.addressVerificationProof = proof;
+    addStep(runContext, "Select postcode address", {
+      ok: true, method: proof.method, lineMatched: proof.lineMatched,
+      postalMatched: proof.postalMatched, postalSource: proof.postalSource,
+    });
     return true;
+  } catch (error) {
+    addStep(runContext, "Select postcode address", {
+      ok: false, code: error.code || "address_selection_failed", ...error.diagnostic,
+    });
+    throw createPortalBlocker(runContext, error.message, {
+      code: error.code || "address_selection_failed", diagnostic: error.diagnostic,
+    });
   }
-
-  addWarning(runContext, "Postcode address selection could not be completed.", result || {});
-  return false;
 }
 
-async function fillManualAddressFields(page, runContext, passenger) {
-  await fillField(
-    page,
-    runContext,
-    "manual address line 1",
-    passenger.addressLine1,
-    /address line 1|address 1|house|street/i,
-    ['input[name*="address"]', 'input[id*="address"]']
-  );
-
-  await fillField(
-    page,
-    runContext,
-    "manual address line 2",
-    passenger.addressLine2,
-    /address line 2|address 2|area|building/i,
-    ['input[name*="address2"]', 'input[id*="address2"]']
-  );
-
-  await fillField(
-    page,
-    runContext,
-    "manual town or city",
-    passenger.townCity,
-    /town|city/i,
-    ['input[name*="town"]', 'input[name*="city"]', 'input[id*="town"]']
-  );
-
-  await fillField(
-    page,
-    runContext,
-    "manual postcode",
-    passenger.postcode,
-    /postcode|post code|postal code/i,
-    ['input[name*="post"]', 'input[id*="post"]']
-  );
+async function verifyFinalReviewAddress(page, runContext, plan) {
+  try {
+    const result = await verifyGreaterAngliaReviewAddress(
+      page, plan.passengerStep || {}, runContext.addressVerificationProof
+    );
+    addStep(runContext, "Verify final review address", result);
+    runContext.diagnostic = { ...runContext.diagnostic, postalValidation: result };
+    return result;
+  } catch (error) {
+    addStep(runContext, "Verify final review address", {
+      ok: false, code: error.code || "final_review_address_mismatch", ...error.diagnostic,
+    });
+    throw createPortalBlocker(runContext, error.message, {
+      code: error.code || "final_review_address_mismatch", diagnostic: error.diagnostic,
+    });
+  }
 }
 
 async function throwIfStillOnPersonalDetailsWithErrors(page, runContext) {
@@ -7523,6 +7205,8 @@ async function prepareConfirmationStep(
     );
   }
 
+  await verifyFinalReviewAddress(page, runContext, plan);
+
   if (!finalSubmitEnabled) {
     // The current Greater Anglia page can keep Submit disabled or inject it only
     // after reCAPTCHA. A dry run has reached its protected endpoint once the
@@ -7861,6 +7545,8 @@ async function runGreaterAngliaPlaywrightSubmission({
       };
     }
 
+    // Recheck after declarations and any portal re-render, immediately before submission.
+    await verifyFinalReviewAddress(page, runContext, portalSubmissionPlan);
     await clickFinalSubmitSafely(page, runContext);
 
     await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
