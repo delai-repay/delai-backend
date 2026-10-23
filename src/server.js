@@ -1,5 +1,6 @@
 import express from "express";
-import { createHash } from "node:crypto";
+import { buildSubmissionSnapshotHash } from "./operators/submissionSnapshot.js";
+import { createClaimFinalReviewHandlers, FINAL_SUBMISSION_ACKNOWLEDGEMENT } from "./operators/claimFinalReview.js";
 import cors from "cors";
 import helmet from "helmet";
 import dotenv from "dotenv";
@@ -186,19 +187,6 @@ function isGreaterAngliaName(value) {
     .replace(/^_+|_+$/g, "");
 
   return normalised === "greater_anglia" || normalised === "greateranglia";
-}
-
-function buildSubmissionSnapshotHash({ claim, detectedDelay, submissionContext }) {
-  return createHash("sha256")
-    .update(
-      JSON.stringify({
-        claimId: claim?.id || null,
-        userId: claim?.user_id || null,
-        detectedDelayId: detectedDelay?.id || null,
-        submissionContext: submissionContext || null,
-      })
-    )
-    .digest("hex");
 }
 
 async function evaluateAndPersistGreaterAngliaDeadline({ claim, detectedDelay }) {
@@ -6051,176 +6039,41 @@ app.post(
   handleDelayConfirmationResponse
 );
 
+const reviewedClaimHandlers = createClaimFinalReviewHandlers({
+  supabase: supabaseAdmin,
+  withTimeout,
+  loadClaimSubmissionContext,
+  validateSubmissionContext,
+  isFinalSubmitEnabled: isGreaterAngliaFinalSubmitEnabled,
+  approveClaimFinalSubmission,
+  revokeClaimFinalSubmissionApproval,
+  queueAutomationJob,
+  deadlineExpiredMessage: "The 28-day Greater Anglia claim deadline has passed.",
+});
+
+app.post(
+  "/claim-final-submit-review",
+  requireAuthenticatedUser,
+  claimMutationRateLimiter,
+  requireClaimId,
+  reviewedClaimHandlers.review
+);
+
 app.post(
   "/approve-claim-final-submit",
   requireAuthenticatedUser,
   claimMutationRateLimiter,
   requireClaimId,
   async (req, res) => {
-    try {
-      const {
-        user_id,
-        claim_id,
-        confirm_final_submission,
-        approval_acknowledgement,
-      } = req.body;
-      const requiredAcknowledgement =
-        "I authorise Delai to submit this claim to Greater Anglia.";
-
-      if (
-        confirm_final_submission !== true ||
-        approval_acknowledgement !== requiredAcknowledgement
-      ) {
-        return res.status(400).json({
-          success: false,
-          error:
-            "Explicit final-submission approval is required for this claim.",
-          required_acknowledgement: requiredAcknowledgement,
-        });
-      }
-
-      const { data: claim, error: claimError } = await withTimeout(
-        supabaseAdmin
-          .from("claims")
-          .select("*")
-          .eq("id", claim_id)
-          .eq("user_id", user_id)
-          .maybeSingle(),
-        10000,
-        "Final-submission approval claim lookup"
-      );
-
-      if (claimError) throw claimError;
-      if (!claim) {
-        return res.status(404).json({ success: false, error: "Claim not found." });
-      }
-      if (claim.status !== "ready_to_submit") {
-        return res.status(400).json({
-          success: false,
-          error: "Claim must be ready to submit before approval.",
-          current_status: claim.status,
-        });
-      }
-      if ((claim.claim_type || "delay_repay") !== "delay_repay") {
-        return res.status(400).json({
-          success: false,
-          error: "This approval route only supports ordinary Delay Repay claims.",
-        });
-      }
-
-      const { data: detectedDelay, error: delayError } = await withTimeout(
-        supabaseAdmin
-          .from("detected_delays")
-          .select("id, operator, passenger_confirmation_status")
-          .eq("id", claim.detected_delay_id)
-          .eq("user_id", user_id)
-          .maybeSingle(),
-        10000,
-        "Final-submission approval delay lookup"
-      );
-
-      if (delayError) throw delayError;
-      if (!detectedDelay || !isGreaterAngliaName(detectedDelay.operator)) {
-        return res.status(400).json({
-          success: false,
-          error: "Claim-specific pilot approval currently supports Greater Anglia only.",
-        });
-      }
-      if (detectedDelay.passenger_confirmation_status !== "confirmed") {
-        return res.status(400).json({
-          success: false,
-          error: "Passenger travel must be confirmed before final submission approval.",
-        });
-      }
-
-      const deadlineStatus = await evaluateAndPersistGreaterAngliaDeadline({
-        claim,
-        detectedDelay,
-      });
-
-      if (!deadlineStatus.eligible) {
-        return res.status(400).json({
-          success: false,
-          error:
-            deadlineStatus.valid === false
-              ? "A valid journey date is required before final submission approval."
-              : "The 28-day Greater Anglia claim deadline has passed.",
-          code: deadlineStatus.reason,
-          deadline: deadlineStatus,
-        });
-      }
-
-      const approvalSubmissionContext = await loadClaimSubmissionContext({
-        claim,
-        detectedDelay,
-      });
-      const approvalValidation = validateSubmissionContext(
-        approvalSubmissionContext
-      );
-
-      if (!approvalValidation.readyForSubmission) {
-        return res.status(400).json({
-          success: false,
-          error: "Claim details changed and must be validated again before approval.",
-          validation: buildValidationResponse(approvalValidation),
-        });
-      }
-
-      const approval = await approveClaimFinalSubmission({
-        supabase: supabaseAdmin,
-        userId: user_id,
-        claimId: claim_id,
-        submissionHash: buildSubmissionSnapshotHash({
-          claim,
-          detectedDelay,
-          submissionContext: approvalSubmissionContext,
-        }),
-      });
-
-      await withTimeout(
-        supabaseAdmin
-          .from("claims")
-          .update({
-            submission_status: "approved_for_submission",
-            submission_error: null,
-          })
-          .eq("id", claim_id)
-          .eq("user_id", user_id),
-        10000,
-        "Mark claim approved for final submission"
-      );
-
-      let automationJob = null;
-      if (isGreaterAngliaFinalSubmitEnabled()) {
-        automationJob = await queueAutomationJob({
-          userId: user_id,
-          claimId: claim_id,
-          jobType: "claim_submit",
-          force: true,
-        });
-      }
-
-      return res.json({
-        success: true,
-        message: isGreaterAngliaFinalSubmitEnabled()
-          ? "Final submission approved for this claim and queued."
-          : "Approval recorded, but the separate global pilot lock remains active.",
-        approval: {
-          status: approval.status,
-          approved_at: approval.approved_at,
-          expires_at: approval.expires_at,
-          generation: approval.generation,
-        },
-        global_pilot_lock_enabled: !isGreaterAngliaFinalSubmitEnabled(),
-        automation_job: automationJob,
-      });
-    } catch (error) {
-      console.error("Approve claim final submit error:", error);
-      return res.status(500).json({
+    const { confirm_final_submission, approval_acknowledgement } = req.body;
+    if (confirm_final_submission !== true || approval_acknowledgement !== FINAL_SUBMISSION_ACKNOWLEDGEMENT) {
+      return res.status(400).json({
         success: false,
-        error: "Failed to approve final submission for this claim.",
+        error: "Explicit final-submission approval is required for this claim.",
+        required_acknowledgement: FINAL_SUBMISSION_ACKNOWLEDGEMENT,
       });
     }
+    return reviewedClaimHandlers.approve(req, res);
   }
 );
 
@@ -6229,41 +6082,7 @@ app.post(
   requireAuthenticatedUser,
   claimMutationRateLimiter,
   requireClaimId,
-  async (req, res) => {
-    try {
-      const { user_id, claim_id } = req.body;
-      const approval = await revokeClaimFinalSubmissionApproval({
-        supabase: supabaseAdmin,
-        userId: user_id,
-        claimId: claim_id,
-      });
-
-      await withTimeout(
-        supabaseAdmin
-          .from("claims")
-          .update({ submission_status: "awaiting_operator_integration" })
-          .eq("id", claim_id)
-          .eq("user_id", user_id)
-          .eq("status", "ready_to_submit"),
-        10000,
-        "Revoke final-submission approval"
-      );
-
-      return res.json({
-        success: true,
-        revoked: Boolean(approval),
-        message: approval
-          ? "Final-submission approval revoked."
-          : "No active final-submission approval was found.",
-      });
-    } catch (error) {
-      console.error("Revoke claim final submit error:", error);
-      return res.status(500).json({
-        success: false,
-        error: "Failed to revoke final-submission approval.",
-      });
-    }
-  }
+  reviewedClaimHandlers.revoke
 );
 
 app.post("/mark-claim-submitted", requireAuthenticatedUser, claimMutationRateLimiter, requireClaimId, async (req, res) => {

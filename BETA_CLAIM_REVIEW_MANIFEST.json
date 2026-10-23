@@ -1,0 +1,72 @@
+{
+  "project": "delai-backend",
+  "guards": [
+    {
+      "target": "src/operators/submissionApprovalService.js",
+      "hash": "b6b90a05ba9bc26b95b6cc0982b23815bade50bb12a5382676505fe8bfc5cad7"
+    },
+    {
+      "target": "src/operators/greaterAngliaPlaywrightExecutor.js",
+      "contains": "greater-anglia-end-to-end-3.4-address-picker"
+    },
+    {
+      "target": "src/operators/claimSubmissionContext.js"
+    },
+    {
+      "target": "src/operators/submissionValidation.js"
+    },
+    {
+      "target": "src/operators/greaterAngliaRequiredInputs.js"
+    },
+    {
+      "target": "src/claims/claimDeadlinePolicy.js"
+    },
+    {
+      "target": "src/payments/feePolicy.js"
+    },
+    {
+      "target": "src/delays/journeyDisruptionRouting.js"
+    }
+  ],
+  "files": [
+    {
+      "target": "src/server.js",
+      "payload": "patches/beta-claim-review/server.js",
+      "before": "f52531de9816cf1695daaac55aab42afc68da8da604aaeed5a21d329921d1568",
+      "after": "e3a522aaeeddac4ba14c49b61890aa1b96c9e161cc73b9f6e4844ac61e1e4e60"
+    },
+    {
+      "target": "package.json",
+      "payload": "patches/beta-claim-review/package.json",
+      "before": "2c13c7885eacb71dc12207a8f301cf849bd81e243460b2513d9be6d7eb5d489b",
+      "after": "b22ff01a9d63559852defb71afb680b620d1d607a185157bd2064908b22bdba5"
+    },
+    {
+      "target": "package-lock.json",
+      "payload": "patches/beta-claim-review/package-lock.json",
+      "before": "585908a3909373d75351f0a16422df8ed4ccb927bb042e35dacae6f7d4fe5d7d",
+      "after": "b99c6a33ef9c541951732a64b2962e4f46c71f06f56ad3f5d1569fed3d225310"
+    },
+    {
+      "target": "src/operators/submissionSnapshot.js",
+      "payload": "patches/beta-claim-review/submissionSnapshot.js",
+      "before": null,
+      "after": "3eae464c4901adfe34df1f9ac6dc5b1ce1a5a9ca88400e18e7bc75c62f0b2096"
+    },
+    {
+      "target": "src/operators/claimFinalReview.js",
+      "payload": "patches/beta-claim-review/claimFinalReview.js",
+      "before": null,
+      "after": "1c5d1610b93d895e7880c7b04e376aac5d169b982cc872145c6d9574bdb56090"
+    },
+    {
+      "target": "scripts/testBetaClaimReview.js",
+      "payload": "patches/beta-claim-review/testBetaClaimReview.js",
+      "before": null,
+      "after": "7652b61d2b736e8e83e68c2056254f7b18b12a30cfda58d3b39b463679af4c93",
+      "previous": [
+        "5808cd376e7a973dd73aa0a45aae71e0e13c3368ca92d0afa990eb1fceb617b9"
+      ]
+    }
+  ]
+}
