@@ -159,7 +159,7 @@ function normaliseDateForInput(value) {
 function createRunContext({ mappedSubmission = null, finalSubmitEnabled = false } = {}) {
   return {
     runId: createSafeRunId(),
-    executorVersion: "greater-anglia-end-to-end-3.3-address-verified",
+    executorVersion: "greater-anglia-end-to-end-3.4-address-picker",
     operator: "Greater Anglia",
     operatorKey: "greater_anglia",
     claimId: mappedSubmission?.claim?.id || null,

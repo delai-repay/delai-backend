@@ -21,35 +21,59 @@ async function test(name, fn) {
 class FixturePage {
   constructor({ kind = "native", bindingWorks = true, needsLookup = false } = {}) {
     Object.assign(this, { kind, bindingWorks, needsLookup, lookedUp: !needsLookup,
-      opened: false, selectedText: wrong, actions: [], reads: 0 });
+      opened: false, selectedText: wrong, actions: [], reads: 0,
+      lookupTyped: kind !== "tracsis", resultsVisible: false });
   }
   async evaluate(_browserFunction, payload) {
     if (payload.mode === "selected") {
       this.reads++;
-      return { found: true, closed: !this.opened, selectedCount: 1,
-        selectedText: this.selectedText, postalValues: [passenger.postcode] };
+      return { found: true, closed: this.kind === "tracsis" ? !this.resultsVisible : !this.opened, selectedCount: 1,
+        selectedText: this.selectedText, postalValues: [passenger.postcode],
+        ...(this.kind === "tracsis" ? { boundFieldReadback: true,
+          boundFirstLine: this.selectedText.split(",")[0] } : {}) };
     }
     if (payload.mode === "review") return { regionCount: 1, lines: [this.reviewText || this.selectedText] };
     const title = { kind: "native", controlToken: "native-0", text: "Mr", value: "mr", index: 0 };
     return {
       // A title dropdown is present even before postcode lookup finishes.
-      options: [title, ...(!this.lookedUp || (this.kind === "custom" && !this.opened) ? [] :
+      options: [title, ...(!this.lookedUp || !this.lookupTyped || (this.kind === "custom" && !this.opened) ? [] :
         [wrong, correct].map((text, index) => this.kind === "native"
           ? { ...nativeOption(text, index), controlToken: "native-1" }
-          : { kind: "custom", controlToken: "combo-0", token: `option-${index}`, text }))],
+          : this.kind === "tracsis"
+            ? { kind: "tracsis", controlToken: "tracsis-postcode", token: `tracsis-option-${index}`, text }
+            : { kind: "custom", controlToken: "combo-0", token: `option-${index}`, text }))],
       controls: [{ token: "native-0", kind: "native" }, ...(this.lookedUp
-        ? [{ token: this.kind === "native" ? "native-1" : "combo-0", kind: this.kind }] : [])],
+        ? [{ token: this.kind === "native" ? "native-1" : this.kind === "tracsis" ? "tracsis-postcode" : "combo-0", kind: this.kind }] : [])],
       lookups: this.needsLookup && !this.lookedUp ? [{ token: "lookup-0" }] : [],
     };
   }
   locator(selector) {
     return {
+      fill: async (value) => {
+        assert.equal(selector, "#postcode #txtPostCode");
+        assert.equal(value, "");
+        this.actions.push(["fill", selector, value]);
+        this.lookupTyped = false;
+      },
+      pressSequentially: async (value) => {
+        assert.equal(selector, "#postcode #txtPostCode");
+        assert.equal(value, passenger.postcode);
+        this.actions.push(["pressSequentially", selector, value]);
+      },
+      press: async (key) => {
+        assert.equal(selector, "#postcode #txtPostCode");
+        assert.equal(key, "Tab");
+        this.actions.push(["press", selector, key]);
+        this.lookupTyped = true;
+        this.resultsVisible = true;
+      },
       click: async () => {
         this.actions.push(["click", selector]);
         if (selector.includes("lookup-0")) this.lookedUp = true;
         else if (selector.includes("combo-0")) this.opened = true;
         else if (selector.includes("option-1")) {
           this.opened = false;
+          this.resultsVisible = false;
           if (this.bindingWorks) this.selectedText = correct;
         } else throw new Error("Unexpected or unsafe click");
       },
@@ -106,7 +130,7 @@ try {
     assert.match(page.actions[1][1], /option-1/);
   });
   await test("clicked label cannot hide wrong bound selection", async () => {
-    for (const kind of ["native", "custom"]) {
+    for (const kind of ["native", "custom", "tracsis"]) {
       const page = new FixturePage({ kind, bindingWorks: false });
       await assert.rejects(selectAndVerifyGreaterAngliaAddress(page, passenger, { timeoutMs: 1000 }),
         { code: "address_selection_mismatch" });
@@ -115,6 +139,22 @@ try {
         ? action === "selectOption" : action === "click" && selector.includes("option-1")),
       "must actually select the exact option before checking a broken binding");
     }
+  });
+  await test("Tracsis lookup receives keyboard events and verifies stored fields", async () => {
+    const page = new FixturePage({ kind: "tracsis" });
+    const proof = await selectAndVerifyGreaterAngliaAddress(page, passenger);
+    assert.equal(proof.method, "exact_tracsis_address_option");
+    assert.equal(proof.postalSource, "bound_form_fields");
+    assert.deepEqual(page.actions.slice(0, 3).map(([action]) => action), ["fill", "pressSequentially", "press"]);
+    assert.match(page.actions[3][1], /tracsis-option-1/);
+    assert.ok(page.reads >= 2);
+  });
+  await test("Tracsis first field must match even if combined text looks correct", () => {
+    const snapshot = { found: true, closed: true, selectedCount: 1,
+      selectedText: correct, postalValues: [passenger.postcode], boundFieldReadback: true };
+    assert.equal(assessSelectedAddress({ ...snapshot, boundFirstLine: "11" }, passenger).ok, false);
+    assert.equal(assessSelectedAddress({ ...snapshot, boundFirstLine: "1 Example Road" }, passenger).ok, false);
+    assert.equal(assessSelectedAddress({ ...snapshot, boundFirstLine: "11 Example Road" }, passenger).ok, true);
   });
   await test("open popup text and conflicting postcode are not selection proof", () => {
     const state = { found: true, closed: true, selectedCount: 1, selectedText: correct, postalValues: [passenger.postcode] };

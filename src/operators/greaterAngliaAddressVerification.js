@@ -100,7 +100,36 @@ export function inspectGreaterAngliaAddressDom({ mode, controlToken = null }) {
     .filter(visible).filter((element) => /post\s*code|postcode|postal\s*code/i.test(label(element)))
     .map((element) => String(element.value || "").trim()).filter(Boolean);
 
+  // Observed on Greater Anglia's live Tracsis form, 23 October 2026.
+  // These are real lookup-result rows, not generic page divs or ARIA options.
+  const portalRoot = document.getElementById("postcode");
+  const portalIds = ["txtPostCode", "txtAddress1", "txtAddress2", "txtCityTown", "txtcountryname"];
+  const portalFields = portalIds.map((id) => portalRoot?.querySelectorAll(`#${id}`));
+  const portalRecognised = Boolean(portalRoot && visible(portalRoot) &&
+    portalRoot.querySelectorAll("#autosuggest-form").length === 1 &&
+    portalFields.every((fields, index) => fields?.length === 1 &&
+      fields[0].tagName === (index === 4 ? "SELECT" : "INPUT")));
+  const portalSuggestions = portalRecognised ? portalRoot.querySelector("#autosuggest-form") : null;
+  const portalRows = () => Array.from(portalSuggestions?.querySelectorAll(
+    ':scope > .item.getFullAddressByID[data-type="Address"][data-id]'
+  ) || []).filter(visible).filter(enabled)
+    .filter((element) => Boolean(element.getAttribute("data-id")?.trim()));
+
   if (mode === "selected") {
+    if (controlToken === "tracsis-postcode") {
+      if (!portalRecognised) return { found: false };
+      // Tracsis keeps these real form controls CSS-hidden after lookup.
+      // Reading them is essential: the clicked suggestion is not binding proof.
+      const [postal, first, second, town, country] = portalFields.map((fields) => String(fields[0].value || "").trim());
+      return {
+        found: true, closed: portalRows().length === 0,
+        selectedCount: first && postal && country ? 1 : 0,
+        selectedText: [first, second, town, postal].filter(Boolean).join(" "),
+        boundFirstLine: first,
+        postalValues: [postal],
+        boundFieldReadback: true,
+      };
+    }
     const control = document.querySelector(`[${controlAttr}="${controlToken}"]`);
     if (!control || !visible(control)) return { found: false };
     if (control.tagName === "SELECT") {
@@ -157,6 +186,16 @@ export function inspectGreaterAngliaAddressDom({ mode, controlToken = null }) {
   const options = [];
   const controls = [];
   const lookups = [];
+  if (portalRecognised) {
+    portalRoot.setAttribute(controlAttr, "tracsis-postcode");
+    controls.push({ token: "tracsis-postcode", kind: "tracsis" });
+    portalRows().forEach((option, index) => {
+      const token = `tracsis-option-${index}`;
+      option.setAttribute(optionAttr, token);
+      options.push({ kind: "tracsis", token, controlToken: "tracsis-postcode",
+        text: text(option), disabled: false });
+    });
+  }
   const native = Array.from(document.querySelectorAll("select")).filter(visible).filter(enabled);
   native.forEach((control, index) => {
     const token = `native-${index}`;
@@ -205,6 +244,9 @@ export function inspectGreaterAngliaAddressDom({ mode, controlToken = null }) {
 
 export function assessSelectedAddress(snapshot, passenger) {
   const check = matchAddressText(snapshot.selectedText, passenger);
+  const lineMatched = snapshot.boundFieldReadback === true
+    ? normaliseAddressText(snapshot.boundFirstLine) === normaliseAddressText(passenger.addressLine1)
+    : check.lineMatched;
   const postalValues = snapshot.postalValues || [];
   const expectedPostal = String(passenger.postcode || "").toUpperCase().replace(/\s+/g, "");
   const formPostalMatched = postalValues.length === 1 &&
@@ -213,10 +255,11 @@ export function assessSelectedAddress(snapshot, passenger) {
     value.toUpperCase().replace(/\s+/g, "") !== expectedPostal);
   const postalMatched = (check.postalPresent ? check.postalMatched : formPostalMatched) && !postalConflict;
   return { ok: snapshot.found === true && snapshot.closed === true && snapshot.selectedCount === 1 &&
-      check.lineMatched && check.localityMatched && postalMatched,
-    lineMatched: check.lineMatched, localityMatched: check.localityMatched, postalMatched,
+      lineMatched && check.localityMatched && postalMatched,
+    lineMatched, localityMatched: check.localityMatched, postalMatched,
     closed: snapshot.closed === true,
-    postalSource: check.postalPresent ? "selected_value" : "personal_details_field" };
+    postalSource: snapshot.boundFieldReadback === true ? "bound_form_fields"
+      : check.postalPresent ? "selected_value" : "personal_details_field" };
 }
 
 export function assessReviewAddress(snapshot, passenger, proof) {
@@ -249,6 +292,16 @@ export async function selectAndVerifyGreaterAngliaAddress(page, passenger, { tim
       "Greater Anglia needs a saved address line 1 and a valid UK postcode before address selection.");
   }
   let scan = await page.evaluate(inspectGreaterAngliaAddressDom, { mode: "scan" });
+  const portalControls = scan.controls.filter((control) => control.kind === "tracsis");
+  if (portalControls.length === 1) {
+    // The live picker reacts to keyboard/blur events. The previous generic
+    // passenger-field filler may not generate that sequence.
+    const postalInput = page.locator("#postcode #txtPostCode");
+    await postalInput.fill("", { timeout: timeoutMs });
+    await postalInput.pressSequentially(String(passenger.postcode).trim(), { timeout: timeoutMs });
+    await postalInput.press("Tab", { timeout: timeoutMs });
+    scan = await page.evaluate(inspectGreaterAngliaAddressDom, { mode: "scan" });
+  }
   if (!scan.options.some((option) => postalCodes(option.text).length > 0) && scan.lookups.length) {
     if (scan.lookups.length !== 1) throw addressError("address_lookup_ambiguous",
       "Greater Anglia returned more than one postcode lookup control.");
@@ -260,7 +313,13 @@ export async function selectAndVerifyGreaterAngliaAddress(page, passenger, { tim
     scan = await page.evaluate(inspectGreaterAngliaAddressDom, { mode: "scan" });
     // A title select's options do not mean the asynchronous address results are ready.
     const hasPostalOptions = scan.options.some((option) => postalCodes(option.text).length > 0);
-    if (hasPostalOptions) break;
+    const hasExactOption = scan.options.some((option) => {
+      const check = matchAddressText(option.text, passenger);
+      return !option.disabled && check.lineMatched && check.localityMatched && check.postalMatched;
+    });
+    // Keyboard autocomplete can briefly render results from a partial postcode.
+    // Give the recognised picker its lookup budget to return the exact address.
+    if (hasExactOption || (portalControls.length === 0 && hasPostalOptions)) break;
     const combos = scan.controls.filter((control) => control.kind === "custom");
     if (!opened && combos.length === 1) {
       await page.locator(`[${CONTROL_ATTR}="${combos[0].token}"]`).click({ timeout: timeoutMs });
@@ -270,7 +329,15 @@ export async function selectAndVerifyGreaterAngliaAddress(page, passenger, { tim
     }
     await pause(page);
   }
-  const choice = chooseExactAddressOption(scan.options, passenger);
+  let choice;
+  try {
+    choice = chooseExactAddressOption(scan.options, passenger);
+  } catch (error) {
+    error.diagnostic = { ...error.diagnostic,
+      recognisedPicker: portalControls.length === 1 ? "tracsis" : "generic",
+      controlCount: scan.controls.length };
+    throw error;
+  }
   if (!choice.controlToken) throw addressError("address_control_unverified",
     "Greater Anglia's address option could not be linked to a selection control.");
   if (choice.kind === "native") {
@@ -290,7 +357,9 @@ export async function selectAndVerifyGreaterAngliaAddress(page, passenger, { tim
     check = assessSelectedAddress(snapshot, passenger);
     consecutive = check.ok ? consecutive + 1 : 0;
     if (consecutive >= 2) return { ...check, version: 1,
-      expectedKey: expectedKey(passenger), method: choice.kind === "native" ? "exact_native_option" : "exact_custom_option" };
+      expectedKey: expectedKey(passenger), method: choice.kind === "tracsis"
+        ? "exact_tracsis_address_option"
+        : choice.kind === "native" ? "exact_native_option" : "exact_custom_option" };
   } while (Date.now() < readDeadline);
   throw addressError("address_selection_mismatch",
     "Greater Anglia's selected address does not match the saved address and postcode. The claim was stopped before continuing.", check);
