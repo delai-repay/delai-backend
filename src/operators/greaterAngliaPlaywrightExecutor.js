@@ -160,7 +160,7 @@ function normaliseDateForInput(value) {
 function createRunContext({ mappedSubmission = null, finalSubmitEnabled = false } = {}) {
   return {
     runId: createSafeRunId(),
-    executorVersion: "greater-anglia-end-to-end-3.5-confirmation-navigation",
+    executorVersion: "greater-anglia-end-to-end-3.6-human-verification",
     operator: "Greater Anglia",
     operatorKey: "greater_anglia",
     claimId: mappedSubmission?.claim?.id || null,
@@ -7096,12 +7096,24 @@ async function inspectFinalSubmitBoundary(page) {
       const style = window.getComputedStyle(element);
       const rect = element.getBoundingClientRect();
       return (
+        activeCaptchaMarker(element) &&
         style.display !== "none" &&
         style.visibility !== "hidden" &&
         Number(style.opacity || 1) !== 0 &&
         rect.width > 0 &&
         rect.height > 0
       );
+    }
+
+    // Detect a configured widget even while its iframe is still loading. An
+    // enabled Submit button is not evidence of a completed security check.
+    function activeCaptchaMarker(element) {
+      for (let current = element; current; current = current.parentElement) {
+        const style = window.getComputedStyle(current);
+        if (current.hidden || style.display === "none" || style.visibility === "hidden" ||
+            Number(style.opacity || 1) === 0) return false;
+      }
+      return element.isConnected;
     }
 
     function textFor(element) {
@@ -7148,6 +7160,10 @@ async function inspectFinalSubmitBoundary(page) {
       finalReviewVisible: /confirm your claim|review (?:your|the) claim/i.test(
         visibleBodyText
       ),
+      recaptchaConfigured: Array.from(document.querySelectorAll(
+        '.g-recaptcha, iframe[src*="recaptcha"]'
+      )).some(activeCaptchaMarker),
+      recaptchaErrorVisible: /\b(?:captcha|recaptcha)\s+(?:error|failed|expired)\b|\b(?:complete|verify)\s+(?:the\s+)?(?:captcha|recaptcha)\b/i.test(visibleBodyText),
       recaptchaVisible: Boolean(
         Array.from(
           document.querySelectorAll(
@@ -7161,6 +7177,33 @@ async function inspectFinalSubmitBoundary(page) {
       termsVisible: /terms (?:&|and) conditions/i.test(visibleBodyText),
     };
   }));
+}
+
+function requireGreaterAngliaHumanVerificationAbsent(runContext, boundary) {
+  if (boundary?.recaptchaVisible !== true && boundary?.recaptchaConfigured !== true &&
+      boundary?.recaptchaErrorVisible !== true) return;
+
+  // A late observation after an attempted Submit must retain the receipt hold.
+  // This guard never solves, clicks, resets or reads a CAPTCHA response token.
+  if (runContext.finalSubmitAttempted === true) {
+    throw createPortalBlocker(runContext,
+      "Greater Anglia may have received this claim. Check the operator receipt before another attempt.",
+      { code: "final_submit_result_uncertain", diagnostic: boundary });
+  }
+  runContext.humanVerification = {
+    required: true,
+    provider: "recaptcha",
+    widgetVisible: boundary.recaptchaVisible === true,
+    widgetConfigured: boundary.recaptchaConfigured === true,
+    portalErrorVisible: boundary.recaptchaErrorVisible === true,
+    actionTaken: false,
+    completionRoute: "operator_website",
+  };
+  setCheckpoint(runContext, "operator_human_verification_required");
+  addStep(runContext, "Operator human verification required", runContext.humanVerification);
+  throw createPortalBlocker(runContext,
+    "Greater Anglia requires a human security check on its claim form. Delai stopped before final Submit.",
+    { code: "operator_human_verification_required", diagnostic: boundary });
 }
 
 async function prepareConfirmationStep(
@@ -7210,11 +7253,11 @@ async function prepareConfirmationStep(
 
   await verifyFinalReviewAddress(page, runContext, plan);
 
+  requireGreaterAngliaHumanVerificationAbsent(runContext, finalBoundary);
+
   if (!finalSubmitEnabled) {
-    // The current Greater Anglia page can keep Submit disabled or inject it only
-    // after reCAPTCHA. A dry run has reached its protected endpoint once the
-    // real Confirm your claim page and fraud warning are visible; it must not
-    // attempt or require the anti-bot challenge while final submission is off.
+    // Preparation can reach review, but a detected human check is an exception
+    // and must not be described as ready for unattended final submission.
     return runContext.diagnostic;
   }
 
@@ -7306,6 +7349,7 @@ async function clickFinalSubmitSafely(page, runContext) {
       { code: "final_submit_safety_lock", missingData: gateFailures, diagnostic: runContext.diagnostic });
   }
   const boundary = await inspectFinalSubmitBoundary(page);
+  requireGreaterAngliaHumanVerificationAbsent(runContext, boundary);
   if (!boundary.finalReviewVisible || !boundary.fraudWarningVisible || !boundary.readyForClick) {
     throw createPortalBlocker(runContext, "Greater Anglia's protected final Submit control needs review.",
       { code: "final_submit_boundary_changed", diagnostic: boundary });
@@ -7329,6 +7373,15 @@ async function clickFinalSubmitSafely(page, runContext) {
   if (count !== 1) {
     throw createPortalBlocker(runContext, `Expected one exact final-submit control, found ${count}.`,
       { code: "final_submit_not_found", diagnostic: boundary });
+  }
+
+  // Recheck after declaration/locator reads, before recording any click intent.
+  const immediateBoundary = await inspectFinalSubmitBoundary(page);
+  requireGreaterAngliaHumanVerificationAbsent(runContext, immediateBoundary);
+  if (!immediateBoundary.finalReviewVisible || !immediateBoundary.fraudWarningVisible ||
+      !immediateBoundary.readyForClick) {
+    throw createPortalBlocker(runContext, "Greater Anglia's protected final Submit control changed before submission.",
+      { code: "final_submit_boundary_changed", diagnostic: immediateBoundary });
   }
 
   // Persist intent before the only irreversible action. A click may succeed
@@ -7615,7 +7668,9 @@ async function runGreaterAngliaPlaywrightSubmission({
         : error.code || "playwright_executor_error",
       missing_data: error.missingData || [],
       diagnostic: runContext.diagnostic,
-      source: "greater_anglia_playwright_executor_error",
+      source: runContext.finalSubmitAttempted !== true && error.code === "operator_human_verification_required"
+        ? "greater_anglia_playwright_human_verification_required"
+        : "greater_anglia_playwright_executor_error",
       operator: "Greater Anglia",
       operatorKey: "greater_anglia",
       integrationStatus: "playwright_executor_error",

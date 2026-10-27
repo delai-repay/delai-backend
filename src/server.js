@@ -790,13 +790,50 @@ function buildValidationResponse(validation) {
   };
 }
 
-function buildOperatorIntegrationPendingCopy({ submissionContext, detectedDelay } = {}) {
+function buildOperatorIntegrationPendingCopy({ submissionContext, detectedDelay, submissionResult } = {}) {
   const operatorName =
     submissionContext?.operator?.displayName ||
     submissionContext?.operator?.suppliedName ||
     detectedDelay?.operator ||
     "this train operator";
 
+  const submission = submissionResult?.submission || submissionResult || {};
+  const blocker = submission.blocker_code;
+  const source = submission.source;
+  if (submission.runContext?.finalSubmitAttempted === true ||
+      ["operator_reference_missing", "final_submit_result_uncertain", "unexpected_receipt_before_final_submit"].includes(blocker)) {
+    return {
+      customer_status: "submission_uncertain",
+      customer_title: "Your submission is being checked",
+      customer_message: `Delai needs to confirm whether ${operatorName} received your claim.`,
+      customer_next_step: "Please wait for this check before trying again.",
+    };
+  }
+  if (blocker === "operator_human_verification_required" ||
+      source === "greater_anglia_playwright_human_verification_required") {
+    return {
+      customer_status: "operator_human_verification_required",
+      customer_title: "The operator needs a security check",
+      customer_message: `${operatorName} requires a human security check before this claim can be sent.`,
+      customer_next_step: "Delai has paused this attempt. Contact Delai support to arrange completion with the operator.",
+    };
+  }
+  if (blocker === "final_submit_safety_lock" || source === "greater_anglia_playwright_executor_safety_locked") {
+    return {
+      customer_status: "prepared_for_review",
+      customer_title: "Your claim reached final review",
+      customer_message: `Delai prepared your claim with ${operatorName} and stopped before sending it.`,
+      customer_next_step: "Review the claim details before authorising submission.",
+    };
+  }
+  if (source === "greater_anglia_playwright_executor_error" || submission.integrationStatus === "playwright_executor_error") {
+    return {
+      customer_status: "manual_review_required",
+      customer_title: "Your submission needs review",
+      customer_message: `Delai needs to check an issue with the submission to ${operatorName}.`,
+      customer_next_step: "Please wait for the submission issue to be reviewed.",
+    };
+  }
   return {
     customer_status: "operator_submission_pending",
     customer_title: "Claim ready for Delai submission",
@@ -2472,6 +2509,7 @@ if (!submissionValidation.readyForSubmission) {
     const operatorPendingCopy = buildOperatorIntegrationPendingCopy({
       submissionContext,
       detectedDelay,
+      submissionResult,
     });
 
     return {
@@ -5597,11 +5635,14 @@ app.post("/submit-claim-with-delai", requireAuthenticatedUser, claimMutationRate
       const operatorPendingCopy = buildOperatorIntegrationPendingCopy({
         submissionContext,
         detectedDelay,
+        submissionResult,
       });
 
       const customerMessage = awaitingInformation
         ? "A few details are still needed before Delai can submit this claim."
-        : submissionResult.customer_message ||
+        : operatorPendingCopy.customer_status !== "operator_submission_pending"
+          ? operatorPendingCopy.customer_message
+          : submissionResult.customer_message ||
           submissionResult.submission?.customer_message ||
           operatorPendingCopy.customer_message;
 

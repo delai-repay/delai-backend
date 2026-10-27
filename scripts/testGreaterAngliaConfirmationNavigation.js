@@ -145,6 +145,7 @@ function finalFixture({ enabled = true, gates = [], boundary = {}, count = 1, de
     setCheckpoint: (ctx, checkpoint) => { ctx.checkpoint = checkpoint; },
     addStep: (ctx, name, details) => ctx.steps.push({ name, ...details }),
   };
+  deps.requireGreaterAngliaHumanVerificationAbsent = actual("requireGreaterAngliaHumanVerificationAbsent", deps);
   return { run: actual("clickFinalSubmitSafely", deps), context, calls, page: passivePage({ getByRole: () => button }) };
 }
 await test("global lock blocks final action", async () => {

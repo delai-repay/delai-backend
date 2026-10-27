@@ -173,6 +173,7 @@ try {
     assert.ok(marker, `Missing production function ${name}`);
     return vm.runInNewContext(`(${source.slice(marker.index, source.indexOf("\n}", marker.index) + 2)})`, deps);
   }
+  deps.requireGreaterAngliaHumanVerificationAbsent = actual("requireGreaterAngliaHumanVerificationAbsent");
   deps.inspectPortalPanel = actual("inspectPortalPanel");
   deps.inspectFinalSubmitBoundary = actual("inspectFinalSubmitBoundary");
   const prepare = actual("prepareConfirmationStep"), submit = actual("clickFinalSubmitSafely"), reference = actual("extractOperatorReference");
