@@ -1,0 +1,67 @@
+{
+  "project": "delai-backend",
+  "guards": [
+    {
+      "target": "src/server.js",
+      "hash": "e3a522aaeeddac4ba14c49b61890aa1b96c9e161cc73b9f6e4844ac61e1e4e60"
+    },
+    {
+      "target": "src/operators/submissionApprovalService.js",
+      "hash": "b6b90a05ba9bc26b95b6cc0982b23815bade50bb12a5382676505fe8bfc5cad7"
+    },
+    {
+      "target": "src/operators/submissionSnapshot.js",
+      "hash": "3eae464c4901adfe34df1f9ac6dc5b1ce1a5a9ca88400e18e7bc75c62f0b2096"
+    },
+    {
+      "target": "src/operators/claimFinalReview.js",
+      "hash": "1c5d1610b93d895e7880c7b04e376aac5d169b982cc872145c6d9574bdb56090"
+    },
+    {
+      "target": "src/operators/greaterAngliaAddressVerification.js",
+      "hash": "3b813ccf10e5aaf5196f554628a3bf9301b67ec4e1b65b760d0cd48087b807ed"
+    },
+    {
+      "target": "src/operators/greaterAngliaOperatorAdapter.js",
+      "contains": "resolveFinalSubmitGate"
+    }
+  ],
+  "files": [
+    {
+      "target": "src/operators/greaterAngliaConfirmationNavigation.js",
+      "payload": "patches/greater-anglia-confirmation-navigation/greaterAngliaConfirmationNavigation.js",
+      "before": null,
+      "after": "6c21d0716bbb7fdbaaf842a93e8e92906123fbfe4922e2cc03e239ee49d28a9f"
+    },
+    {
+      "target": "src/operators/greaterAngliaPlaywrightExecutor.js",
+      "payload": "patches/greater-anglia-confirmation-navigation/greaterAngliaPlaywrightExecutor.js",
+      "before": "79da0071356877eb11d9b12fb1a670f62df8cc678464dd894d81c8c0b8a9a403",
+      "after": "68eb8eca76c4061143d9119b1f22be4df89db09371df7f2b8df70ae00b5324b1"
+    },
+    {
+      "target": "scripts/testGreaterAngliaConfirmationNavigation.js",
+      "payload": "patches/greater-anglia-confirmation-navigation/testGreaterAngliaConfirmationNavigation.js",
+      "before": null,
+      "after": "3c57ba539b727989c58d00def013f397225a3105eae611883efcd12b9d145300"
+    },
+    {
+      "target": "scripts/testGreaterAngliaConfirmationBrowser.js",
+      "payload": "patches/greater-anglia-confirmation-navigation/testGreaterAngliaConfirmationBrowser.js",
+      "before": null,
+      "after": "e63e8795cb265bbe7b119b0ac0ea26194b554e0f79047e8d1420c51ef9a54e1d"
+    },
+    {
+      "target": "scripts/sql/checkGreaterAngliaConfirmationAttempt.sql",
+      "payload": "patches/greater-anglia-confirmation-navigation/checkGreaterAngliaConfirmationAttempt.sql",
+      "before": null,
+      "after": "8287e3a9d29fab9925dcfed7fb7d4731983700f1d486e95c6fecd8fa6a2187bf"
+    },
+    {
+      "target": "package.json",
+      "payload": "patches/greater-anglia-confirmation-navigation/package.json",
+      "before": "b22ff01a9d63559852defb71afb680b620d1d607a185157bd2064908b22bdba5",
+      "after": "2c1c516fc5d4fdfed5d2bfbf83de81bb45249ad753b9d993897065025a9c71ff"
+    }
+  ]
+}

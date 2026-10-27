@@ -1,6 +1,7 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
 import { selectAndVerifyGreaterAngliaAddress, verifyGreaterAngliaReviewAddress } from "./greaterAngliaAddressVerification.js";
+import { readGreaterAngliaPortalPage, selectGreaterAngliaCustomerDeclaration, verifyGreaterAngliaCustomerDeclaration } from "./greaterAngliaConfirmationNavigation.js";
 
 const DEFAULT_TIMEOUT_MS = 45000;
 const GREATER_ANGLIA_SMARTCARD_LENGTH = 18;
@@ -159,7 +160,7 @@ function normaliseDateForInput(value) {
 function createRunContext({ mappedSubmission = null, finalSubmitEnabled = false } = {}) {
   return {
     runId: createSafeRunId(),
-    executorVersion: "greater-anglia-end-to-end-3.4-address-picker",
+    executorVersion: "greater-anglia-end-to-end-3.5-confirmation-navigation",
     operator: "Greater Anglia",
     operatorKey: "greater_anglia",
     claimId: mappedSubmission?.claim?.id || null,
@@ -444,7 +445,7 @@ function createPortalBlocker(runContext, message, {
 }
 
 async function getPortalFingerprint(page) {
-  return page.evaluate(() => {
+  return readGreaterAngliaPortalPage(page, () => page.evaluate(() => {
     function visible(element) {
       const style = window.getComputedStyle(element);
       const rect = element.getBoundingClientRect();
@@ -485,7 +486,7 @@ async function getPortalFingerprint(page) {
       .slice(0, 1600);
 
     return `${text}||${controls}`;
-  });
+  }));
 }
 
 async function waitForPortalChange(page, previousFingerprint, timeout = 6500) {
@@ -551,7 +552,7 @@ async function waitForPortalChange(page, previousFingerprint, timeout = 6500) {
 }
 
 async function inspectPortalPanel(page) {
-  return page.evaluate(() => {
+  return readGreaterAngliaPortalPage(page, () => page.evaluate(() => {
     function visible(element) {
       const style = window.getComputedStyle(element);
       const rect = element.getBoundingClientRect();
@@ -771,7 +772,7 @@ async function inspectPortalPanel(page) {
       actions,
       validationErrors,
     };
-  });
+  }));
 }
 
 async function fillVisibleControlByPatterns(
@@ -7090,7 +7091,7 @@ function getFinalSubmissionGateFailures() {
 }
 
 async function inspectFinalSubmitBoundary(page) {
-  return page.evaluate(() => {
+  return readGreaterAngliaPortalPage(page, () => page.evaluate(() => {
     function rendered(element) {
       const style = window.getComputedStyle(element);
       const rect = element.getBoundingClientRect();
@@ -7159,7 +7160,7 @@ async function inspectFinalSubmitBoundary(page) {
       ),
       termsVisible: /terms (?:&|and) conditions/i.test(visibleBodyText),
     };
-  });
+  }));
 }
 
 async function prepareConfirmationStep(
@@ -7170,12 +7171,14 @@ async function prepareConfirmationStep(
   finalSubmitEnabled
 ) {
   const confirmation = plan.confirmationStep || {};
+  runContext.customerDeclarationRequired = confirmation.customerDeclarationRequired === true;
   const snapshot = await inspectPortalPanel(page);
   runContext.diagnostic = snapshot;
 
   if (snapshot.stage === "submitted") {
-    setCheckpoint(runContext, "submitted");
-    return snapshot;
+    throw createPortalBlocker(runContext,
+      "Greater Anglia displayed a possible receipt before the protected final-submit step. The attempt needs review.",
+      { code: "unexpected_receipt_before_final_submit", diagnostic: snapshot });
   }
 
   if (snapshot.stage !== "confirmation") {
@@ -7270,88 +7273,85 @@ async function prepareConfirmationStep(
   }
 
   if (confirmation.customerDeclarationRequired === true) {
-    const declaration = await selectVisibleChoice(
-      page,
-      runContext,
-      "customer declaration",
-      ["I confirm", "I declare", "I agree"],
-      ["declaration", "confirm", "fraud", "information.*correct"]
-    );
-
-    if (!declaration?.ok) {
-      throw createPortalBlocker(
-        runContext,
-        "Greater Anglia requires a customer declaration, but the declaration control could not be selected safely.",
-        { code: "declaration_not_found", diagnostic: snapshot }
-      );
+    try {
+      const declaration = await selectGreaterAngliaCustomerDeclaration(page);
+      runContext.customerDeclarationVerified = true;
+      runContext.customerDeclarationMethod = declaration.method;
+      addStep(runContext, declaration.method === "declaration_on_final_submit" ? "Verify declaration on final Submit" : "Select customer declaration", declaration);
+    } catch (error) {
+      throw createPortalBlocker(runContext, error.message,
+        { code: error.code || "declaration_needs_review", diagnostic: snapshot });
     }
   }
 
-  return await inspectPortalPanel(page);
+  const finalSnapshot = await inspectPortalPanel(page);
+  runContext.diagnostic = finalSnapshot;
+  if (finalSnapshot.stage !== "confirmation") {
+    throw createPortalBlocker(runContext,
+      "Greater Anglia left final review while the declaration was being checked. The attempt needs review.",
+      { code: "confirmation_changed_after_declaration", diagnostic: finalSnapshot });
+  }
+  return finalSnapshot;
 }
 
 async function clickFinalSubmitSafely(page, runContext) {
-  const result = await page.evaluate(() => {
-    function visible(element) {
-      const style = window.getComputedStyle(element);
-      const rect = element.getBoundingClientRect();
-      return (
-        style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        Number(style.opacity || 1) !== 0 &&
-        rect.width > 0 &&
-        rect.height > 0 &&
-        !element.disabled
-      );
+  if (runContext.finalSubmitAttempted === true) {
+    throw createPortalBlocker(runContext,
+      "A final Submit action has already been attempted in this browser run. Check the operator receipt before another attempt.",
+      { code: "final_submit_already_attempted", diagnostic: runContext.diagnostic });
+  }
+  const gateFailures = getFinalSubmissionGateFailures();
+  if (runContext.finalSubmitEnabled !== true || gateFailures.length > 0) {
+    throw createPortalBlocker(runContext, "Greater Anglia final submission is not authorised.",
+      { code: "final_submit_safety_lock", missingData: gateFailures, diagnostic: runContext.diagnostic });
+  }
+  const boundary = await inspectFinalSubmitBoundary(page);
+  if (!boundary.finalReviewVisible || !boundary.fraudWarningVisible || !boundary.readyForClick) {
+    throw createPortalBlocker(runContext, "Greater Anglia's protected final Submit control needs review.",
+      { code: "final_submit_boundary_changed", diagnostic: boundary });
+  }
+  if (runContext.customerDeclarationRequired === true) {
+    if (runContext.customerDeclarationVerified !== true) {
+      throw createPortalBlocker(runContext, "Greater Anglia's declaration has not been verified.",
+        { code: "declaration_not_checked", diagnostic: boundary });
     }
-
-    const candidates = Array.from(
-      document.querySelectorAll('button, input[type="submit"], a, [role="button"]')
-    )
-      .filter(visible)
-      .map((element) => ({
-        element,
-        text: String(
-          element.innerText ||
-            element.textContent ||
-            element.value ||
-            element.getAttribute("aria-label") ||
-            ""
-        )
-          .replace(/\s+/g, " ")
-          .trim(),
-      }))
-      .filter((entry) =>
-        /^(submit|submit claim|submit my claim|confirm and submit|complete claim)$/i.test(entry.text)
-      );
-
-    if (candidates.length !== 1) {
-      return {
-        ok: false,
-        reason: `Expected one exact final-submit control, found ${candidates.length}.`,
-        candidates: candidates.map((entry) => entry.text),
-      };
+    try {
+      await verifyGreaterAngliaCustomerDeclaration(page, { expectedMethod: runContext.customerDeclarationMethod });
+    } catch (error) {
+      throw createPortalBlocker(runContext, error.message,
+        { code: error.code || "declaration_not_checked", diagnostic: boundary });
     }
-
-    candidates[0].element.scrollIntoView({ block: "center", inline: "center" });
-    candidates[0].element.click();
-    return { ok: true, text: candidates[0].text };
-  });
-
-  if (!result?.ok) {
-    throw createPortalBlocker(
-      runContext,
-      `Greater Anglia final Submit could not be clicked safely: ${result?.reason || "unknown reason"}`,
-      { code: "final_submit_not_found", diagnostic: await inspectPortalPanel(page) }
-    );
+  }
+  const finalText = /^(submit|submit claim|submit my claim|confirm and submit|complete claim)$/i;
+  const button = page.getByRole("button", { name: finalText })
+    .or(page.getByRole("link", { name: finalText }));
+  const count = await readGreaterAngliaPortalPage(page, () => button.count());
+  if (count !== 1) {
+    throw createPortalBlocker(runContext, `Expected one exact final-submit control, found ${count}.`,
+      { code: "final_submit_not_found", diagnostic: boundary });
   }
 
+  // Persist intent before the only irreversible action. A click may succeed
+  // even if its response is interrupted by navigation. Never retry this action.
+  runContext.finalSubmitAttempted = true;
+  runContext.finalSubmitOutcome = "unknown";
+  setCheckpoint(runContext, "final_submit_attempted");
+  addStep(runContext, "Attempt final Submit", { retryAllowed: false });
+  try {
+    await button.click({ timeout: 10000 });
+  } catch (error) {
+    throw createPortalBlocker(runContext,
+      "Greater Anglia's final Submit action could not be confirmed. Check the operator receipt before another attempt.",
+      { code: "final_submit_result_uncertain", diagnostic: runContext.diagnostic });
+  }
+  runContext.finalSubmitOutcome = "click_returned";
+  const result = { ok: true, method: "exact_playwright_final_submit_control" };
   addStep(runContext, "Click final Submit", result);
   return result;
 }
 
 async function extractOperatorReference(page) {
-  const bodyText = await page.locator("body").innerText({ timeout: 10000 });
+  const bodyText = await readGreaterAngliaPortalPage(page, () => page.locator("body").innerText({ timeout: 10000 }));
   const referenceMatch = bodyText.match(
     /(?:claim reference number|reference number|claim reference)\s*:?\s*([A-Z0-9][A-Z0-9\-/]{5,})/i
   );
@@ -7606,9 +7606,13 @@ async function runGreaterAngliaPlaywrightSubmission({
     return {
       submitted: false,
       blocked: true,
-      reason: error.message,
+      reason: runContext.finalSubmitAttempted === true
+        ? "Greater Anglia may have received this claim. Check the operator receipt before another attempt."
+        : error.message,
       checkpoint: runContext.checkpoint,
-      blocker_code: error.code || "playwright_executor_error",
+      blocker_code: runContext.finalSubmitAttempted === true
+        ? "final_submit_result_uncertain"
+        : error.code || "playwright_executor_error",
       missing_data: error.missingData || [],
       diagnostic: runContext.diagnostic,
       source: "greater_anglia_playwright_executor_error",
@@ -7620,7 +7624,7 @@ async function runGreaterAngliaPlaywrightSubmission({
       customer_message:
         "Your claim is ready. Delai is preparing automatic submission for Greater Anglia.",
       customer_next_step:
-        "No further action is needed right now. Delai has saved the claim and will retry once the browser automation issue is resolved.",
+        "Delai has saved this attempt for review. Check the submission result before authorising another attempt.",
       finalSubmitEnabled: finalSubmitEnabled === true,
       runContext,
       mappedSubmission,
